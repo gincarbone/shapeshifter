@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Marcello Incarbone. MIT License — see LICENSE file.
 """ShapeShifter — local OpenAI-compatible context compression proxy."""
 from __future__ import annotations
 

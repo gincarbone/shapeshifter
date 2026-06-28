@@ -337,6 +337,20 @@ shapeshifter/
 
 ---
 
+## Author
+
+**ShapeShifter** was conceived and built by **Marcello Incarbone**.
+
+The core idea — structural reformulation of conversation context rather than lossy compression, with language-agnostic coding-session detection and per-provider key management — originated from his work on reducing LLM costs in multi-turn coding agent workflows.
+
+If you build on ShapeShifter, attribution in your README or documentation is appreciated.
+
+---
+
 ## License
 
-MIT
+MIT License © 2026 Marcello Incarbone
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, subject to the condition that the above copyright notice and this permission notice are included in all copies or substantial portions of the Software.
+
+See the [LICENSE](LICENSE) file for the full text.

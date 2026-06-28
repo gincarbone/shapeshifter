@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Marcello Incarbone. MIT License — see LICENSE file.
 """Context transformers — one function per mode.
 
 Each transformer receives the raw concatenated context string and returns a
