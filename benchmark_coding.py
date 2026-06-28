@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Marcello Incarbone. MIT License — see LICENSE file.
+# Copyright (c) 2026 Gaetano Marcello Incarbone. MIT License — see LICENSE file.
 """
 Multi-turn coding benchmark for ShapeShifter context modes.
 

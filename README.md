@@ -339,7 +339,7 @@ shapeshifter/
 
 ## Author
 
-**ShapeShifter** was conceived and built by **Marcello Incarbone**.
+**ShapeShifter** was conceived and built by *Gaetano Marcello Incarbone**.
 
 The core idea — structural reformulation of conversation context rather than lossy compression, with language-agnostic coding-session detection and per-provider key management — originated from his work on reducing LLM costs in multi-turn coding agent workflows.
 
