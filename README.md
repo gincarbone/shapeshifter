@@ -7,6 +7,8 @@ Human language is powerful, but it's not efficient in an LLM context. This conte
 
 ShapeShifter reshapes the context to make it more efficient, smaller, concentrated, and distilled.
 
+It is a structural reformulation of the context using more efficient archetypes and methodologies, eliminating duplications, cleaning up redundant information.
+
 ShapeShifter sits between your AI client (Cline, Continue, Open WebUI, curl, your own code) and any OpenAI-compatible upstream API. It restructures the conversation context using one of nine configurable transformer modes and forwards a leaner payload to the model. Your client sees a standard OpenAI API — no changes required on either side.
 
 ```

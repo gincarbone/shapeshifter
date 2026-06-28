@@ -14,3 +14,5 @@ benchmark_results/
 dist/
 .DS_Store
 Thumbs.db
+
+.shapeshifter_keys.json

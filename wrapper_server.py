@@ -62,6 +62,147 @@ _ctx_store: dict[str, dict] = {}   # request_id -> {raw, transformed} (last 50)
 _ctx_store_keys: deque[str] = deque(maxlen=50)
 _sse_queues: list[asyncio.Queue] = []
 _current_model: str = DEFAULT_MODEL
+_model_input_cost_per_1m: float | None = None   # $/1M input tokens, None if unknown
+
+# Mutable runtime config (mirrors .env, survives within session, persisted on save)
+_config: dict = {
+    "upstream_base_url": UPSTREAM_URL,
+    "upstream_api_key":  UPSTREAM_KEY,
+    "default_model":     DEFAULT_MODEL,
+    "context_mode":      CONTEXT_MODE,
+    "auto_mode":         AUTO_MODE,
+    "log_requests":      LOG_REQUESTS,
+    "log_responses":     LOG_RESPONSES,
+    "log_dir":           str(LOG_DIR),
+}
+
+_ENV_PATH  = Path(__file__).parent / ".env"
+_KEYS_PATH = Path(__file__).parent / ".shapeshifter_keys.json"
+
+# Known OpenAI-compatible providers
+KNOWN_PROVIDERS: list[dict] = [
+    {"name": "OpenRouter",   "url": "https://openrouter.ai/api/v1",     "key_required": True},
+    {"name": "DeepSeek",     "url": "https://api.deepseek.com/v1",       "key_required": True},
+    {"name": "OpenAI",       "url": "https://api.openai.com/v1",         "key_required": True},
+    {"name": "Groq",         "url": "https://api.groq.com/openai/v1",    "key_required": True},
+    {"name": "Together AI",  "url": "https://api.together.xyz/v1",       "key_required": True},
+    {"name": "Mistral",      "url": "https://api.mistral.ai/v1",         "key_required": True},
+    {"name": "Fireworks",    "url": "https://api.fireworks.ai/inference/v1", "key_required": True},
+    {"name": "Ollama",       "url": "http://localhost:11434/v1",          "key_required": False},
+    {"name": "LM Studio",    "url": "http://localhost:1234/v1",           "key_required": False},
+]
+_LOCAL_URLS = {p["url"] for p in KNOWN_PROVIDERS if not p["key_required"]}
+
+# Per-provider API key storage (url → key), persisted to .shapeshifter_keys.json
+_provider_keys: dict[str, str] = {}
+
+
+def _load_provider_keys() -> None:
+    global _provider_keys
+    if _KEYS_PATH.exists():
+        try:
+            _provider_keys = json.loads(_KEYS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _provider_keys = {}
+    # seed from current .env key if not already stored
+    if UPSTREAM_URL and UPSTREAM_KEY and UPSTREAM_URL not in _provider_keys:
+        _provider_keys[UPSTREAM_URL] = UPSTREAM_KEY
+
+
+def _save_provider_keys() -> None:
+    _KEYS_PATH.write_text(json.dumps(_provider_keys, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+_load_provider_keys()
+
+
+def _key_status(url: str) -> str:
+    """Return 'saved', 'not_set', or 'not_required'."""
+    if url in _LOCAL_URLS:
+        return "not_required"
+    return "saved" if _provider_keys.get(url) else "not_set"
+
+
+def _mask_key(key: str) -> str:
+    if not key:
+        return ""
+    return key[:8] + "..." + key[-4:] if len(key) > 12 else "*" * len(key)
+
+_ENV_KEY_MAP = {
+    "upstream_base_url": "UPSTREAM_BASE_URL",
+    "upstream_api_key":  "UPSTREAM_API_KEY",
+    "default_model":     "DEFAULT_MODEL",
+    "context_mode":      "CONTEXT_MODE",
+    "auto_mode":         "AUTO_MODE",
+    "log_requests":      "LOG_REQUESTS",
+    "log_responses":     "LOG_RESPONSES",
+    "log_dir":           "LOG_DIR",
+}
+
+
+def _apply_config(cfg: dict) -> None:
+    """Apply a config dict to runtime globals."""
+    global UPSTREAM_URL, UPSTREAM_KEY, _current_model, CONTEXT_MODE
+    global AUTO_MODE, LOG_REQUESTS, LOG_RESPONSES, LOG_DIR
+    if "upstream_base_url" in cfg:
+        UPSTREAM_URL = cfg["upstream_base_url"]
+        # auto-load saved key for this URL if no explicit key provided
+        if "upstream_api_key" not in cfg and UPSTREAM_URL in _provider_keys:
+            UPSTREAM_KEY = _provider_keys[UPSTREAM_URL]
+            _config["upstream_api_key"] = UPSTREAM_KEY
+    if "upstream_api_key" in cfg:
+        UPSTREAM_KEY = cfg["upstream_api_key"]
+        # persist key for current URL
+        if UPSTREAM_URL and UPSTREAM_KEY:
+            _provider_keys[UPSTREAM_URL] = UPSTREAM_KEY
+            _save_provider_keys()
+    if "default_model" in cfg:
+        _current_model = cfg["default_model"]
+    if "context_mode" in cfg and cfg["context_mode"] in VALID_MODES:
+        CONTEXT_MODE = cfg["context_mode"]
+    if "auto_mode" in cfg:
+        AUTO_MODE = str(cfg["auto_mode"]).lower() in ("true", "1", "yes")
+    if "log_requests" in cfg:
+        LOG_REQUESTS = str(cfg["log_requests"]).lower() in ("true", "1", "yes")
+    if "log_responses" in cfg:
+        LOG_RESPONSES = str(cfg["log_responses"]).lower() in ("true", "1", "yes")
+    if "log_dir" in cfg:
+        LOG_DIR = Path(cfg["log_dir"])
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _config.update(cfg)
+
+
+def _persist_env(cfg: dict) -> None:
+    """Write changed keys back to .env, preserving comments and unknown lines."""
+    lines = _ENV_PATH.read_text(encoding="utf-8").splitlines() if _ENV_PATH.exists() else []
+    updated: set[str] = set()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        if "=" in stripped:
+            env_key = stripped.split("=", 1)[0].strip()
+            for cfg_key, mapped in _ENV_KEY_MAP.items():
+                if env_key == mapped and cfg_key in cfg:
+                    val = cfg[cfg_key]
+                    if isinstance(val, bool):
+                        val = "true" if val else "false"
+                    new_lines.append(f"{mapped}={val}")
+                    updated.add(cfg_key)
+                    break
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+    # append any keys not already in file
+    for cfg_key, val in cfg.items():
+        if cfg_key not in updated and cfg_key in _ENV_KEY_MAP:
+            if isinstance(val, bool):
+                val = "true" if val else "false"
+            new_lines.append(f"{_ENV_KEY_MAP[cfg_key]}={val}")
+    _ENV_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
 def _record_stats(mode: str, s: dict, latency_ms: float, request_id: str = "", model: str = "") -> None:
@@ -115,14 +256,20 @@ def _build_summary() -> dict:
                 (1 - v["tok_after"] / v["tok_before"]) * 100 if v["tok_before"] else 0, 1
             ),
         }
+    dollars_saved = None
+    if _model_input_cost_per_1m is not None and _stats["total_tokens_saved"] > 0:
+        dollars_saved = round(_stats["total_tokens_saved"] / 1_000_000 * _model_input_cost_per_1m, 6)
+
     return {
-        "total_requests":    _stats["total_requests"],
-        "total_tokens_saved": _stats["total_tokens_saved"],
-        "total_tokens_before": _stats["total_tokens_before"],
-        "avg_ratio":         round(avg_ratio, 3),
-        "avg_reduction_pct": round((1 - avg_ratio) * 100, 1),
-        "uptime_s":          uptime_s,
-        "by_mode":           by_mode_out,
+        "total_requests":       _stats["total_requests"],
+        "total_tokens_saved":   _stats["total_tokens_saved"],
+        "total_tokens_before":  _stats["total_tokens_before"],
+        "avg_ratio":            round(avg_ratio, 3),
+        "avg_reduction_pct":    round((1 - avg_ratio) * 100, 1),
+        "uptime_s":             uptime_s,
+        "by_mode":              by_mode_out,
+        "dollars_saved":        dollars_saved,
+        "model_input_cost_per_1m": _model_input_cost_per_1m,
     }
 
 # ---------------------------------------------------------------------------
@@ -205,7 +352,7 @@ async def get_model():
 
 @app.post("/v1/config/model")
 async def set_model(request: Request):
-    global _current_model
+    global _current_model, _model_input_cost_per_1m
     try:
         body = await request.json()
         new_model = body.get("model", "").strip()
@@ -214,7 +361,223 @@ async def set_model(request: Request):
     if not new_model:
         return JSONResponse({"error": "model field required"}, status_code=400)
     _current_model = new_model
-    return {"model": _current_model, "status": "updated"}
+    _config["default_model"] = new_model
+    # optional pricing from Browse selection
+    cost = body.get("input_cost_per_1m")
+    if cost is not None:
+        try:
+            _model_input_cost_per_1m = float(cost)
+        except (TypeError, ValueError):
+            _model_input_cost_per_1m = None
+    return {"model": _current_model, "status": "updated",
+            "input_cost_per_1m": _model_input_cost_per_1m}
+
+
+def _is_ollama_url(base: str) -> bool:
+    return ":11434" in base
+
+
+def _normalise_models(raw: dict) -> list[dict]:
+    """Convert any provider's model list response to our standard format."""
+    models = []
+
+    # OpenAI-compatible: {"data": [...]}
+    items = raw.get("data") or []
+
+    # Ollama /api/tags: {"models": [...]}
+    if not items and "models" in raw:
+        for m in raw["models"]:
+            name = m.get("name") or m.get("model", "")
+            details = m.get("details") or {}
+            label = name
+            if details.get("parameter_size"):
+                label += f" ({details['parameter_size']}"
+                if details.get("quantization_level"):
+                    label += f" {details['quantization_level']}"
+                label += ")"
+            models.append({
+                "id": name, "name": label,
+                "context_length": None,
+                "input_cost_per_1m": None,
+                "output_cost_per_1m": None,
+            })
+        return sorted(models, key=lambda x: x["id"])
+
+    for m in items:
+        pricing = m.get("pricing") or {}
+
+        # OpenRouter: pricing.prompt / pricing.completion (per-token strings)
+        def _cost(key: str) -> float | None:
+            try:
+                v = float(pricing.get(key, 0) or 0)
+                return round(v * 1_000_000, 4) if v else (0.0 if key in pricing else None)
+            except (TypeError, ValueError):
+                return None
+
+        inp = _cost("prompt")
+        out = _cost("completion")
+
+        # Together AI: pricing.input / pricing.output (per-million floats)
+        if inp is None and "input" in pricing:
+            try:   inp = round(float(pricing["input"]),  4)
+            except Exception: pass
+        if out is None and "output" in pricing:
+            try:   out = round(float(pricing["output"]), 4)
+            except Exception: pass
+
+        models.append({
+            "id":              m.get("id", ""),
+            "name":            m.get("name") or m.get("id", ""),
+            "context_length":  m.get("context_length") or m.get("context_window"),
+            "input_cost_per_1m":  inp,
+            "output_cost_per_1m": out,
+        })
+
+    return sorted(models, key=lambda x: x["id"])
+
+
+@app.get("/v1/upstream/models")
+async def upstream_models(url: str = ""):
+    """Proxy GET /models to the requested provider (or active upstream if url omitted).
+
+    The caller passes ?url=<base_url> so Browse always fetches from the provider
+    currently selected in the dashboard, not necessarily the active one.
+    Key is looked up from _provider_keys; falls back to UPSTREAM_KEY for active URL.
+    """
+    import httpx  # already installed via requirements
+
+    target_base = (url.strip() or UPSTREAM_URL).rstrip("/")
+    if not target_base:
+        return JSONResponse({"error": "No provider URL specified or configured"}, status_code=503)
+
+    # resolve key: use saved key for that URL, fall back to active key if same URL
+    api_key = _provider_keys.get(target_base) or (UPSTREAM_KEY if target_base == UPSTREAM_URL.rstrip("/") else "")
+
+    headers: dict = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Ollama uses /api/tags instead of /v1/models
+    if _is_ollama_url(target_base):
+        # strip /v1 suffix if present to reach the root
+        ollama_root = target_base.replace("/v1", "")
+        fetch_url = ollama_root.rstrip("/") + "/api/tags"
+    else:
+        fetch_url = target_base + "/models"
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(fetch_url, headers=headers)
+            r.raise_for_status()
+            raw = r.json()
+    except Exception as exc:
+        return JSONResponse({"error": f"Upstream error: {exc}"}, status_code=502)
+
+    models = _normalise_models(raw)
+    return JSONResponse({"data": models, "count": len(models), "provider_url": target_base})
+
+
+@app.get("/v1/config/providers")
+async def get_providers():
+    """Return known providers with key status for each."""
+    result = []
+    for p in KNOWN_PROVIDERS:
+        status = _key_status(p["url"])
+        result.append({**p, "key_status": status,
+                        "key_masked": _mask_key(_provider_keys.get(p["url"], ""))})
+    # also include any custom URL already in use
+    current_url = _config.get("upstream_base_url", "")
+    known_urls = {p["url"] for p in KNOWN_PROVIDERS}
+    if current_url and current_url not in known_urls:
+        result.append({
+            "name": "Custom", "url": current_url, "key_required": True,
+            "key_status": _key_status(current_url),
+            "key_masked": _mask_key(_provider_keys.get(current_url, "")),
+        })
+    return JSONResponse({"providers": result})
+
+
+@app.get("/v1/config/key-status")
+async def get_key_status(url: str = ""):
+    """Return key status for a given URL."""
+    target = url or _config.get("upstream_base_url", "")
+    return JSONResponse({
+        "url": target,
+        "status": _key_status(target),
+        "key_masked": _mask_key(_provider_keys.get(target, "")),
+    })
+
+
+@app.post("/v1/config/provider-key")
+async def save_provider_key(request: Request):
+    """Save an API key for a specific provider URL."""
+    global UPSTREAM_KEY
+    try:
+        body = await request.json()
+        url = body.get("url", "").strip()
+        key = body.get("key", "").strip()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not url:
+        return JSONResponse({"error": "url required"}, status_code=400)
+    if key:
+        _provider_keys[url] = key
+    elif url in _provider_keys:
+        del _provider_keys[url]
+    # if this is the active URL, update runtime key too
+    if url == _config.get("upstream_base_url"):
+        UPSTREAM_KEY = key
+        _config["upstream_api_key"] = key
+    try:
+        _save_provider_keys()
+        persisted = True
+    except Exception:
+        persisted = False
+    return JSONResponse({"status": "saved", "persisted": persisted,
+                         "key_status": _key_status(url)})
+
+
+@app.get("/v1/config/settings")
+async def get_settings():
+    masked = dict(_config)
+    current_url = masked.get("upstream_base_url", "")
+    masked["upstream_api_key"] = _mask_key(masked.get("upstream_api_key", ""))
+    masked["valid_modes"] = sorted(VALID_MODES)
+    masked["host"] = HOST
+    masked["port"] = PORT
+    masked["key_status"] = _key_status(current_url)
+    return JSONResponse(masked)
+
+
+@app.post("/v1/config/settings")
+async def update_settings(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    allowed = set(_ENV_KEY_MAP.keys())
+    unknown = [k for k in body if k not in allowed]
+    if unknown:
+        return JSONResponse({"error": f"Unknown fields: {unknown}"}, status_code=400)
+
+    if "context_mode" in body and body["context_mode"] not in VALID_MODES:
+        return JSONResponse(
+            {"error": f"Invalid context_mode. Valid: {sorted(VALID_MODES)}"},
+            status_code=400,
+        )
+
+    _apply_config(body)
+    try:
+        _persist_env(body)
+        persisted = True
+    except Exception:
+        persisted = False
+
+    masked = dict(_config)
+    key = masked.get("upstream_api_key", "")
+    masked["upstream_api_key"] = key[:8] + "..." + key[-4:] if len(key) > 12 else ("*" * len(key))
+    return JSONResponse({"status": "updated", "persisted_to_env": persisted, "settings": masked})
 
 
 @app.get("/v1/requests/{request_id}/context")
@@ -418,186 +781,383 @@ async def dashboard():
 
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
-<html lang="it">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ShapeShifter Dashboard</title>
 <style>
-  :root {
-    --bg: #0f1117; --panel: #1a1d27; --border: #2a2d3e;
-    --accent: #7c6af7; --green: #22c55e; --yellow: #eab308;
-    --red: #ef4444; --text: #e2e8f0; --muted: #64748b;
-    --font: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: var(--font);
-         font-size: 13px; min-height: 100vh; padding: 20px 20px 48px; }
-  h1 { font-size: 18px; color: var(--accent); margin-bottom: 6px; letter-spacing: 1px; }
-  .subtitle { color: var(--muted); font-size: 11px; margin-bottom: 16px; }
+:root {
+  --bg:#0f1117; --panel:#1a1d27; --border:#2a2d3e;
+  --accent:#7c6af7; --green:#22c55e; --yellow:#eab308;
+  --red:#ef4444; --text:#e2e8f0; --muted:#64748b;
+  --font:'JetBrains Mono','Cascadia Code',Consolas,monospace;
+  --sb-w:300px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);
+     font-size:13px;display:flex;flex-direction:column;height:100vh;overflow:hidden}
 
-  /* model bar */
-  .model-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
-               background: var(--panel); border: 1px solid var(--border);
-               border-radius: 8px; padding: 10px 14px; }
-  .model-bar label { color: var(--muted); font-size: 10px; text-transform: uppercase;
-                     letter-spacing: 1px; white-space: nowrap; }
-  .model-bar input { flex: 1; background: var(--bg); border: 1px solid var(--border);
-                     border-radius: 4px; color: var(--text); font-family: var(--font);
-                     font-size: 12px; padding: 5px 9px; outline: none; }
-  .model-bar input:focus { border-color: var(--accent); }
-  .btn { background: var(--accent); color: #fff; border: none; border-radius: 4px;
-         padding: 5px 14px; font-family: var(--font); font-size: 11px;
-         cursor: pointer; white-space: nowrap; }
-  .btn:hover { opacity: 0.85; }
-  .btn.sm { padding: 2px 9px; font-size: 10px; }
-  #model-status { font-size: 10px; color: var(--green); min-width: 60px; }
+/* ── Topbar ── */
+#topbar{display:flex;align-items:center;gap:12px;padding:0 16px;height:44px;
+        background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0;z-index:50}
+#sb-btn{background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer;
+        line-height:1;padding:4px 6px;border-radius:4px}
+#sb-btn:hover{color:var(--accent);background:rgba(124,106,247,.1)}
+#topbar h1{font-size:15px;color:var(--accent);letter-spacing:1px;margin-right:auto}
+.conn-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+          background:var(--red);margin-right:5px;transition:background .3s}
+.conn-dot.ok{background:var(--green)}
+#topbar .sub{color:var(--muted);font-size:10px}
+#sb-last-top{color:var(--muted);font-size:10px;max-width:320px;
+             overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-  /* top cards */
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr));
-           gap: 12px; margin-bottom: 24px; }
-  .card { background: var(--panel); border: 1px solid var(--border);
-          border-radius: 8px; padding: 16px; }
-  .card-label { color: var(--muted); font-size: 10px; text-transform: uppercase;
-                letter-spacing: 1px; margin-bottom: 8px; }
-  .card-value { font-size: 28px; font-weight: bold; }
-  .card-sub   { color: var(--muted); font-size: 10px; margin-top: 4px; }
-  .green { color: var(--green); }
-  .yellow { color: var(--yellow); }
-  .accent { color: var(--accent); }
+/* ── Layout ── */
+#layout{display:flex;flex:1;overflow:hidden}
 
-  /* tables */
-  .panel { background: var(--panel); border: 1px solid var(--border);
-           border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
-              color: var(--muted); margin-bottom: 12px; }
-  table { width: 100%; border-collapse: collapse; }
-  th { color: var(--muted); font-size: 10px; text-transform: uppercase;
-       letter-spacing: 1px; text-align: left; padding: 6px 10px;
-       border-bottom: 1px solid var(--border); }
-  td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: rgba(124,106,247,0.06); }
-  .mode-pill { display: inline-block; padding: 2px 8px; border-radius: 4px;
-               font-size: 10px; background: rgba(124,106,247,0.15);
-               color: var(--accent); }
-  .bar-wrap { width: 100%; background: var(--border); border-radius: 3px; height: 6px; }
-  .bar { height: 6px; border-radius: 3px; background: var(--green);
-         transition: width 0.5s ease; }
+/* ── Sidebar ── */
+#sidebar{width:var(--sb-w);background:var(--panel);border-right:1px solid var(--border);
+         display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;
+         transition:width .25s ease,opacity .25s ease;flex-shrink:0}
+#sidebar.collapsed{width:0;opacity:0;pointer-events:none}
+.sb-section{border-bottom:1px solid var(--border);padding:14px}
+.sb-section h2{color:var(--muted);font-size:9px;text-transform:uppercase;
+               letter-spacing:1px;margin-bottom:10px}
 
-  /* live feed */
-  #feed { max-height: 380px; overflow-y: auto; }
-  .feed-row { display: grid;
-              grid-template-columns: 62px 90px 110px 72px 72px 62px 72px 60px;
-              gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--border);
-              font-size: 11px; align-items: center; }
-  .feed-row.header { color: var(--muted); font-size: 10px; text-transform: uppercase;
-                     letter-spacing: 1px; position: sticky; top: 0;
-                     background: var(--panel); z-index: 1; }
-  .feed-row.new { animation: flash 0.6s ease; }
-  @keyframes flash { from { background: rgba(124,106,247,0.25); } to { background: transparent; } }
+/* model row */
+.model-row{display:flex;gap:6px;align-items:center}
+.model-row input{flex:1;background:var(--bg);border:1px solid var(--border);
+                 border-radius:4px;color:var(--text);font-family:var(--font);
+                 font-size:11px;padding:5px 8px;outline:none;min-width:0}
+.model-row input:focus{border-color:var(--accent)}
 
-  /* modal */
-  #modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
-                   z-index: 100; align-items: center; justify-content: center; }
-  #modal-overlay.open { display: flex; }
-  #modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-           width: min(860px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }
-  #modal-header { display: flex; justify-content: space-between; align-items: center;
-                  padding: 14px 18px; border-bottom: 1px solid var(--border); }
-  #modal-title { font-size: 13px; color: var(--accent); }
-  #modal-meta  { font-size: 10px; color: var(--muted); margin-top: 3px; }
-  #modal-close { background: none; border: none; color: var(--muted); font-size: 18px;
-                 cursor: pointer; line-height: 1; }
-  #modal-close:hover { color: var(--text); }
-  #modal-body { overflow-y: auto; padding: 16px 18px; }
-  #modal-ctx { white-space: pre-wrap; font-size: 11px; line-height: 1.6;
-               color: var(--text); background: var(--bg); border: 1px solid var(--border);
-               border-radius: 6px; padding: 14px; }
+/* settings fields */
+.sf{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+.sf label{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:1px}
+.sf input,.sf select{background:var(--bg);border:1px solid var(--border);border-radius:4px;
+                     color:var(--text);font-family:var(--font);font-size:11px;
+                     padding:5px 8px;outline:none;width:100%}
+.sf input:focus,.sf select:focus{border-color:var(--accent)}
+.sf .hint{color:var(--muted);font-size:9px}
+.key-wrap{position:relative}
+.key-wrap input{padding-right:46px}
+.show-key{position:absolute;right:6px;top:22px;background:none;border:none;
+          color:var(--muted);font-size:9px;cursor:pointer;font-family:var(--font)}
+.key-badge{font-size:9px;padding:1px 6px;border-radius:3px;font-weight:bold;letter-spacing:.5px}
+.key-badge.saved{background:rgba(34,197,94,.15);color:var(--green)}
+.key-badge.not_set{background:rgba(239,68,68,.15);color:var(--red)}
+.key-badge.not_required{background:rgba(100,116,139,.12);color:var(--muted)}
+.tog-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.tog-row .hint{color:var(--muted);font-size:9px}
+.tog{position:relative;display:inline-block;width:30px;height:16px;flex-shrink:0}
+.tog input{opacity:0;width:0;height:0}
+.tog-sl{position:absolute;inset:0;background:var(--border);border-radius:16px;
+        cursor:pointer;transition:background .2s}
+.tog-sl:before{content:'';position:absolute;width:10px;height:10px;
+               left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s}
+.tog input:checked + .tog-sl{background:var(--accent)}
+.tog input:checked + .tog-sl:before{transform:translateX(14px)}
+.ro-val{background:var(--bg);border:1px solid var(--border);border-radius:4px;
+        padding:5px 8px;font-size:11px;color:var(--muted)}
+.sb-actions{display:flex;gap:6px;align-items:center;margin-top:4px}
+#settings-status{font-size:9px;color:var(--green)}
 
-  /* status bar */
-  #statusbar { position: fixed; bottom: 0; left: 0; right: 0;
-               background: var(--panel); border-top: 1px solid var(--border);
-               padding: 6px 20px; font-size: 10px; color: var(--muted);
-               display: flex; gap: 20px; }
-  #conn-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-              background: var(--red); margin-right: 6px; transition: background 0.3s; }
-  #conn-dot.ok { background: var(--green); }
-  @media (max-width: 700px) {
-    .cards { grid-template-columns: 1fr 1fr; }
-    .feed-row { grid-template-columns: 55px 80px 80px 60px 60px 1fr; }
-    .feed-row :nth-child(7), .feed-row :nth-child(8) { display: none; }
-  }
+/* ── Buttons ── */
+.btn{background:var(--accent);color:#fff;border:none;border-radius:4px;
+     padding:4px 12px;font-family:var(--font);font-size:10px;cursor:pointer;white-space:nowrap}
+.btn:hover{opacity:.85}
+.btn.sm{padding:2px 7px;font-size:9px}
+.btn.ghost{background:transparent;border:1px solid var(--border);color:var(--muted)}
+.btn.ghost:hover{border-color:var(--accent);color:var(--accent)}
+#model-status{font-size:9px;color:var(--green);min-width:40px}
+
+/* ── Main area ── */
+#main{flex:1;overflow-y:auto;padding:16px 16px 48px}
+
+/* ── Cards ── */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+       gap:10px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card-label{color:var(--muted);font-size:9px;text-transform:uppercase;
+            letter-spacing:1px;margin-bottom:6px}
+.card-value{font-size:26px;font-weight:bold}
+.card-sub{color:var(--muted);font-size:9px;margin-top:3px}
+.green{color:var(--green)}.yellow{color:var(--yellow)}.accent{color:var(--accent)}
+
+/* ── Panels ── */
+.panel{background:var(--panel);border:1px solid var(--border);
+       border-radius:8px;padding:14px;margin-bottom:14px}
+.panel h2{font-size:10px;text-transform:uppercase;letter-spacing:1px;
+          color:var(--muted);margin-bottom:10px}
+table{width:100%;border-collapse:collapse}
+th{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:1px;
+   text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}
+td{padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(124,106,247,.05)}
+.mode-pill{display:inline-block;padding:2px 7px;border-radius:4px;font-size:9px;
+           background:rgba(124,106,247,.15);color:var(--accent)}
+.bar-wrap{width:100%;background:var(--border);border-radius:3px;height:5px}
+.bar{height:5px;border-radius:3px;background:var(--green);transition:width .5s}
+
+/* ── Feed ── */
+#feed{max-height:340px;overflow-y:auto}
+.feed-row{display:grid;
+          grid-template-columns:58px 86px 106px 68px 68px 58px 68px 56px;
+          gap:4px;padding:4px 8px;border-bottom:1px solid var(--border);
+          font-size:10px;align-items:center}
+.feed-row.header{color:var(--muted);font-size:9px;text-transform:uppercase;
+                 letter-spacing:1px;position:sticky;top:0;background:var(--panel);z-index:1}
+.feed-row.new{animation:flash .6s ease}
+@keyframes flash{from{background:rgba(124,106,247,.25)}to{background:transparent}}
+
+/* ── Models modal ── */
+#models-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);
+                z-index:200;align-items:center;justify-content:center}
+#models-overlay.open{display:flex}
+#models-modal{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+              width:min(820px,95vw);max-height:85vh;display:flex;flex-direction:column}
+#models-header{display:flex;justify-content:space-between;align-items:center;
+               padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0;gap:10px}
+#models-header h3{font-size:12px;color:var(--accent);white-space:nowrap}
+#models-search{background:var(--bg);border:1px solid var(--border);border-radius:4px;
+               color:var(--text);font-family:var(--font);font-size:11px;
+               padding:4px 9px;outline:none;flex:1;max-width:280px}
+#models-search:focus{border-color:var(--accent)}
+#models-close{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer}
+#models-close:hover{color:var(--text)}
+#models-table-wrap{overflow-y:auto;flex:1}
+#models-table{width:100%;border-collapse:collapse}
+#models-table th{position:sticky;top:0;background:var(--panel);color:var(--muted);
+                 font-size:9px;text-transform:uppercase;letter-spacing:1px;
+                 text-align:left;padding:7px 10px;border-bottom:1px solid var(--border);
+                 cursor:pointer;user-select:none}
+#models-table th:hover{color:var(--text)}
+#models-table td{padding:6px 10px;border-bottom:1px solid var(--border);font-size:10px;vertical-align:middle}
+#models-table tr:hover td{background:rgba(108,99,255,.07);cursor:pointer}
+.cost-cell{text-align:right;font-variant-numeric:tabular-nums}
+.cost-free{color:var(--green)}.cost-cheap{color:var(--green)}
+.cost-mid{color:var(--yellow)}.cost-expensive{color:var(--red)}
+#models-status{padding:8px 16px;font-size:9px;color:var(--muted);
+               border-top:1px solid var(--border);flex-shrink:0}
+
+/* ── Context modal ── */
+#modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
+               z-index:100;align-items:center;justify-content:center}
+#modal-overlay.open{display:flex}
+#modal{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+       width:min(860px,92vw);max-height:80vh;display:flex;flex-direction:column}
+#modal-header{display:flex;justify-content:space-between;align-items:center;
+              padding:12px 16px;border-bottom:1px solid var(--border)}
+#modal-title{font-size:12px;color:var(--accent)}
+#modal-meta{font-size:9px;color:var(--muted);margin-top:2px}
+#modal-close{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer}
+#modal-close:hover{color:var(--text)}
+#modal-body{overflow-y:auto;padding:14px 16px}
+#modal-ctx{white-space:pre-wrap;font-size:10px;line-height:1.6;color:var(--text);
+           background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}
+
+@media(max-width:600px){
+  .cards{grid-template-columns:1fr 1fr}
+  .feed-row{grid-template-columns:50px 70px 70px 55px 55px 1fr}
+  .feed-row :nth-child(7),.feed-row :nth-child(8){display:none}
+}
 </style>
 </head>
 <body>
-<h1>&#9889; ShapeShifter</h1>
-<p class="subtitle">Real-time token compression dashboard &nbsp;&middot;&nbsp;
-  <span id="conn-dot"></span><span id="conn-label">connecting...</span>
-</p>
 
-<!-- Model selector -->
-<div class="model-bar">
-  <label>Model</label>
-  <input id="model-input" type="text" placeholder="e.g. deepseek/deepseek-v4-flash" />
-  <button class="btn" onclick="applyModel()">Apply</button>
-  <span id="model-status"></span>
+<!-- Topbar -->
+<div id="topbar">
+  <button id="sb-btn" onclick="toggleSidebar()" title="Toggle settings">&#9776;</button>
+  <h1>&#9889; ShapeShifter</h1>
+  <span id="sb-last-top"></span>
+  <span class="sub"><span class="conn-dot" id="conn-dot"></span><span id="conn-label">connecting…</span></span>
 </div>
 
-<div class="cards">
-  <div class="card">
-    <div class="card-label">Requests</div>
-    <div class="card-value accent" id="c-reqs">0</div>
-    <div class="card-sub">total this session</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Tokens Saved</div>
-    <div class="card-value green" id="c-saved">0</div>
-    <div class="card-sub">input tokens not sent to cloud</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Avg Compression</div>
-    <div class="card-value yellow" id="c-ratio">&#8212;</div>
-    <div class="card-sub">ratio vs raw context</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Avg Reduction</div>
-    <div class="card-value green" id="c-reduc">&#8212;</div>
-    <div class="card-sub">token reduction %</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Uptime</div>
-    <div class="card-value accent" id="c-uptime">0s</div>
-    <div class="card-sub">server running</div>
-  </div>
-</div>
+<div id="layout">
 
-<div class="panel">
-  <h2>Mode breakdown</h2>
-  <table>
-    <thead>
-      <tr>
+<!-- ═══════════ SIDEBAR ═══════════ -->
+<div id="sidebar">
+
+  <!-- Settings -->
+  <div class="sb-section" style="flex:1">
+    <h2>&#9881; Settings</h2>
+
+    <div class="sf">
+      <label>Provider</label>
+      <select id="s-provider" onchange="onProviderChange()">
+        <option value="">— select provider —</option>
+      </select>
+    </div>
+
+    <div class="sf">
+      <label>Base URL</label>
+      <input id="s-url" type="text" placeholder="https://openrouter.ai/api/v1" oninput="onUrlInput()" />
+      <span class="hint">Any OpenAI-compatible endpoint</span>
+    </div>
+
+    <div class="sf key-wrap">
+      <label style="display:flex;align-items:center;gap:6px">
+        API Key
+        <span id="key-badge" class="key-badge"></span>
+      </label>
+      <input id="s-key" type="password" placeholder="sk-…" oninput="onKeyInput()" />
+      <button class="show-key" id="key-action-btn" onclick="keyActionClick()">show</button>
+      <span class="hint" id="key-hint"></span>
+    </div>
+
+    <!-- Model -->
+    <div class="sf">
+      <label>Model</label>
+      <div class="model-row">
+        <input id="model-input" type="text" placeholder="e.g. deepseek/deepseek-v4-flash" />
+      </div>
+      <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
+        <button class="btn ghost" onclick="openModelsBrowser()">Browse</button>
+        <button class="btn" onclick="applyModel()">Apply</button>
+        <span id="model-status"></span>
+      </div>
+    </div>
+
+    <div class="sf">
+      <label>Context Mode</label>
+      <select id="s-mode">
+        <option value="hybrid">hybrid</option>
+        <option value="incremental">incremental</option>
+        <option value="yaml">yaml</option>
+        <option value="raw">raw</option>
+        <option value="minimal">minimal</option>
+        <option value="json">json</option>
+        <option value="table">table</option>
+        <option value="symbolic">symbolic</option>
+        <option value="matrix">matrix</option>
+      </select>
+    </div>
+
+    <div class="sf">
+      <label>Log Directory</label>
+      <input id="s-logdir" type="text" placeholder="logs" />
+    </div>
+
+    <div class="tog-row">
+      <label class="tog"><input type="checkbox" id="s-auto"/><span class="tog-sl"></span></label>
+      <span class="hint">Auto-select mode per request</span>
+    </div>
+    <div class="tog-row">
+      <label class="tog"><input type="checkbox" id="s-logreq"/><span class="tog-sl"></span></label>
+      <span class="hint">Log requests</span>
+    </div>
+    <div class="tog-row">
+      <label class="tog"><input type="checkbox" id="s-logres"/><span class="tog-sl"></span></label>
+      <span class="hint">Log responses</span>
+    </div>
+
+    <div class="sb-actions">
+      <button class="btn" onclick="saveSettings()">Save &amp; Apply</button>
+      <button class="btn ghost" onclick="loadSettings()">Reset</button>
+      <span id="settings-status"></span>
+    </div>
+  </div>
+
+  <!-- Server info -->
+  <div class="sb-section">
+    <h2>&#128274; Server (read-only)</h2>
+    <div class="sf"><label>Host</label><div class="ro-val" id="s-host">—</div></div>
+    <div class="sf"><label>Port</label><div class="ro-val" id="s-port">—</div></div>
+    <div class="sf" style="margin-bottom:0">
+      <span class="hint">Restart the server to change host/port</span>
+    </div>
+  </div>
+
+</div><!-- /sidebar -->
+
+<!-- ═══════════ MAIN ═══════════ -->
+<div id="main">
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Requests</div>
+      <div class="card-value accent" id="c-reqs">0</div>
+      <div class="card-sub">total this session</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Tokens Saved</div>
+      <div class="card-value green" id="c-saved">0</div>
+      <div class="card-sub">input tokens not sent</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Avg Compression</div>
+      <div class="card-value yellow" id="c-ratio">&#8212;</div>
+      <div class="card-sub">ratio vs raw</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Avg Reduction</div>
+      <div class="card-value green" id="c-reduc">&#8212;</div>
+      <div class="card-sub">token reduction %</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Uptime</div>
+      <div class="card-value accent" id="c-uptime">0s</div>
+      <div class="card-sub">server running</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Est. $ Saved</div>
+      <div class="card-value green" id="c-dollars">&#8212;</div>
+      <div class="card-sub" id="c-dollars-sub">select model in Browse for pricing</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Mode breakdown</h2>
+    <table>
+      <thead><tr>
         <th>Mode</th><th>Requests</th><th>Avg In Before</th>
         <th>Avg In After</th><th>Avg Saved</th><th>Reduction %</th><th>Bar</th>
-      </tr>
-    </thead>
-    <tbody id="mode-tbody"></tbody>
-  </table>
-</div>
+      </tr></thead>
+      <tbody id="mode-tbody"></tbody>
+    </table>
+  </div>
 
-<div class="panel">
-  <h2>Live request feed</h2>
-  <div id="feed">
-    <div class="feed-row header">
-      <span>Time</span><span>Mode</span><span>Model</span>
-      <span>Tok Before</span><span>Tok After</span><span>Saved</span>
-      <span>Reduc%</span><span>Context</span>
+  <div class="panel">
+    <h2>Live request feed</h2>
+    <div id="feed">
+      <div class="feed-row header">
+        <span>Time</span><span>Mode</span><span>Model</span>
+        <span>Tok Before</span><span>Tok After</span><span>Saved</span>
+        <span>Reduc%</span><span>Context</span>
+      </div>
+      <div id="feed-rows"></div>
     </div>
-    <div id="feed-rows"></div>
+  </div>
+
+</div><!-- /main -->
+</div><!-- /layout -->
+
+<!-- Models browser modal -->
+<div id="models-overlay" onclick="closeModelsBrowser(event)">
+  <div id="models-modal">
+    <div id="models-header">
+      <h3>&#128269; Browse Models</h3>
+      <input id="models-search" type="text" placeholder="Search model ID or name…" oninput="filterModels()" />
+      <button id="models-close" onclick="closeModelsBrowser()">&#x2715;</button>
+    </div>
+    <div id="models-table-wrap">
+      <table id="models-table">
+        <thead><tr>
+          <th onclick="sortModels('id')">Model ID &#8597;</th>
+          <th onclick="sortModels('name')">Name &#8597;</th>
+          <th onclick="sortModels('context_length')" style="text-align:right">Context &#8597;</th>
+          <th onclick="sortModels('input_cost_per_1m')" style="text-align:right">Input /1M &#8597;</th>
+          <th onclick="sortModels('output_cost_per_1m')" style="text-align:right">Output /1M &#8597;</th>
+        </tr></thead>
+        <tbody id="models-tbody"></tbody>
+      </table>
+    </div>
+    <div id="models-status">Loading…</div>
   </div>
 </div>
 
-<!-- Context modal -->
+<!-- Context viewer modal -->
 <div id="modal-overlay" onclick="closeModal(event)">
   <div id="modal">
     <div id="modal-header">
@@ -606,197 +1166,427 @@ _DASHBOARD_HTML = """\
         <div id="modal-meta"></div>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
-        <button class="btn sm" id="btn-raw"         onclick="switchView('raw')">Original</button>
-        <button class="btn sm" id="btn-transformed" onclick="switchView('transformed')" style="opacity:0.45">Modified</button>
+        <button class="btn sm" id="btn-raw" onclick="switchView('raw')">Original</button>
+        <button class="btn sm" id="btn-transformed" onclick="switchView('transformed')" style="opacity:.45">Modified</button>
         <button id="modal-close" onclick="closeModal()">&#x2715;</button>
       </div>
     </div>
-    <div id="modal-body">
-      <pre id="modal-ctx">loading...</pre>
-    </div>
+    <div id="modal-body"><pre id="modal-ctx">loading…</pre></div>
   </div>
-</div>
-
-<div id="statusbar">
-  <span><span id="conn-dot2"></span> SSE stream</span>
-  <span id="sb-last">waiting for requests...</span>
-  <span>endpoint: <strong>http://127.0.0.1:__PORT__/v1/chat/completions</strong></span>
 </div>
 
 <script>
 const PORT = location.port || '8787';
-document.querySelectorAll('strong').forEach(el => {
-  el.textContent = el.textContent.replace('__PORT__', PORT);
-});
 
-// load current model on start
-fetch('/v1/config/model').then(r => r.json()).then(d => {
-  document.getElementById('model-input').value = d.model || '';
-});
+// ── Sidebar ──────────────────────────────────────────────────────
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('collapsed');
+}
 
-async function applyModel() {
-  const val = document.getElementById('model-input').value.trim();
-  if (!val) return;
-  const st = document.getElementById('model-status');
-  st.style.color = 'var(--yellow)';
-  st.textContent = 'saving...';
+// ── Settings + Provider management ───────────────────────────────
+let _providers = [];
+
+function onKeyInput() {
+  const inp = document.getElementById('s-key');
+  const btn = document.getElementById('key-action-btn');
+  if (inp.value.trim()) {
+    btn.textContent = 'OK';
+    btn.style.color = 'var(--green)';
+  } else {
+    btn.textContent = inp.type === 'password' ? 'show' : 'hide';
+    btn.style.color = '';
+  }
+}
+
+async function keyActionClick() {
+  const inp = document.getElementById('s-key');
+  const btn = document.getElementById('key-action-btn');
+  const key = inp.value.trim();
+
+  if (key) {
+    // Save key for current provider
+    const url = currentSelectedUrl();
+    if (!url) return;
+    btn.textContent = '…'; btn.style.color = 'var(--yellow)';
+    try {
+      const r = await fetch('/v1/config/provider-key', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url, key})
+      });
+      const d = await r.json();
+      if (d.status === 'saved') {
+        inp.value = '';
+        inp.type  = 'password';
+        btn.textContent = 'show'; btn.style.color = '';
+        await refreshKeyBadge();
+        await loadProviders();  // refresh dropdown icons
+      } else {
+        btn.textContent = 'err'; btn.style.color = 'var(--red)';
+        setTimeout(() => { btn.textContent = 'OK'; btn.style.color = 'var(--green)'; }, 2000);
+      }
+    } catch(e) {
+      btn.textContent = 'err'; btn.style.color = 'var(--red)';
+      setTimeout(() => { btn.textContent = 'OK'; btn.style.color = 'var(--green)'; }, 2000);
+    }
+  } else {
+    // Toggle show/hide
+    inp.type = inp.type === 'password' ? 'text' : 'password';
+    btn.textContent = inp.type === 'password' ? 'show' : 'hide';
+    btn.style.color = '';
+  }
+}
+
+function setKeyBadge(status, maskedKey) {
+  const badge = document.getElementById('key-badge');
+  const hint  = document.getElementById('key-hint');
+  const inp   = document.getElementById('s-key');
+  const btn   = document.getElementById('key-action-btn');
+  badge.className = 'key-badge ' + status;
+  // reset button to show/hide state whenever badge updates
+  inp.type = 'password';
+  btn.textContent = 'show'; btn.style.color = '';
+  if (status === 'saved') {
+    badge.textContent = '✓ saved';
+    hint.textContent  = maskedKey || '';
+    inp.placeholder   = 'type new key to replace';
+  } else if (status === 'not_required') {
+    badge.textContent = '○ not required';
+    hint.textContent  = 'Local provider — no key needed';
+    inp.placeholder   = '';
+  } else {
+    badge.textContent = '⚠ not provided';
+    hint.textContent  = 'Type the key then click OK to save';
+    inp.placeholder   = 'sk-…';
+  }
+}
+
+// Returns the URL currently shown in the URL field (or the dropdown selection)
+function currentSelectedUrl() {
+  const urlField = document.getElementById('s-url').value.trim();
+  return urlField || document.getElementById('s-provider').value || '';
+}
+
+async function refreshKeyBadge() {
+  const url = currentSelectedUrl();
+  if (!url) { setKeyBadge('not_set', ''); return; }
   try {
-    const r = await fetch('/v1/config/model', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model: val})
+    const r = await fetch('/v1/config/key-status?url=' + encodeURIComponent(url));
+    const d = await r.json();
+    setKeyBadge(d.status, d.key_masked);
+  } catch(e) { setKeyBadge('not_set', ''); }
+}
+
+async function onProviderChange() {
+  const sel = document.getElementById('s-provider');
+  const url = sel.value;
+  if (!url) return;
+  document.getElementById('s-url').value = url;
+  document.getElementById('s-key').value = '';  // always clear — key belongs to that provider
+  await refreshKeyBadge();
+}
+
+async function onUrlInput() {
+  const url = document.getElementById('s-url').value.trim();
+  if (!url) return;
+  // sync provider dropdown selection to matching entry (or blank for custom)
+  const sel = document.getElementById('s-provider');
+  const match = Array.from(sel.options).find(o => o.value === url);
+  sel.value = match ? url : '';
+  // clear key field — switching URL means we're targeting a different provider
+  document.getElementById('s-key').value = '';
+  await refreshKeyBadge();
+}
+
+async function loadProviders() {
+  const r = await fetch('/v1/config/providers');
+  const d = await r.json();
+  _providers = d.providers || [];
+  const sel = document.getElementById('s-provider');
+  const currentUrl = document.getElementById('s-url').value;
+  // rebuild options (keep placeholder)
+  while (sel.options.length > 1) sel.remove(1);
+  _providers.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.url;
+    const icon = p.key_status === 'saved' ? ' ✓' : p.key_status === 'not_required' ? '' : ' ⚠';
+    opt.textContent = p.name + icon;
+    sel.appendChild(opt);
+  });
+  if (currentUrl) sel.value = currentUrl;
+}
+
+async function loadSettings() {
+  const r = await fetch('/v1/config/settings');
+  const d = await r.json();
+  const url = d.upstream_base_url || '';
+  document.getElementById('s-url').value   = url;
+  document.getElementById('s-key').value   = '';
+  document.getElementById('s-mode').value  = d.context_mode || 'hybrid';
+  document.getElementById('s-logdir').value= d.log_dir || 'logs';
+  document.getElementById('s-auto').checked    = !!d.auto_mode;
+  document.getElementById('s-logreq').checked  = !!d.log_requests;
+  document.getElementById('s-logres').checked  = !!d.log_responses;
+  document.getElementById('s-host').textContent= d.host || '—';
+  document.getElementById('s-port').textContent= d.port || '—';
+  document.getElementById('model-input').value = d.default_model || '';
+  // load providers first so the dropdown is populated
+  await loadProviders();
+  // badge reflects the KEY STATUS of the currently selected URL, not _config's key
+  await refreshKeyBadge();
+}
+
+async function saveSettings() {
+  const st  = document.getElementById('settings-status');
+  const url = document.getElementById('s-url').value.trim();
+  const key = document.getElementById('s-key').value.trim();
+  st.style.color = 'var(--yellow)'; st.textContent = 'saving…';
+
+  // if a key was entered, save it to provider-key store first
+  if (key && url) {
+    await fetch('/v1/config/provider-key', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url, key})
+    });
+  }
+
+  const payload = {
+    upstream_base_url: url,
+    context_mode:      document.getElementById('s-mode').value,
+    log_dir:           document.getElementById('s-logdir').value.trim(),
+    auto_mode:         document.getElementById('s-auto').checked,
+    log_requests:      document.getElementById('s-logreq').checked,
+    log_responses:     document.getElementById('s-logres').checked,
+  };
+  if (key) payload.upstream_api_key = key;
+
+  try {
+    const r = await fetch('/v1/config/settings', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
     });
     const d = await r.json();
     if (d.status === 'updated') {
       st.style.color = 'var(--green)';
-      st.textContent = 'saved!';
-    } else {
-      st.style.color = 'var(--red)';
-      st.textContent = d.error || 'error';
-    }
-  } catch(e) {
-    st.style.color = 'var(--red)';
-    st.textContent = 'error';
-  }
-  setTimeout(() => { st.textContent = ''; }, 2500);
+      st.textContent = d.persisted_to_env ? 'Saved ✓' : 'Applied';
+      await loadSettings();
+    } else { st.style.color='var(--red)'; st.textContent = d.error||'error'; }
+  } catch(e) { st.style.color='var(--red)'; st.textContent='network error'; }
+  setTimeout(()=>{ st.textContent=''; }, 3000);
 }
 
-document.getElementById('model-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') applyModel();
+// ── Model quick bar ───────────────────────────────────────────────
+async function applyModel() {
+  const val = document.getElementById('model-input').value.trim();
+  if (!val) return;
+  const st = document.getElementById('model-status');
+  st.style.color='var(--yellow)'; st.textContent='…';
+  try {
+    const r = await fetch('/v1/config/model',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({model:val})});
+    const d = await r.json();
+    st.style.color = d.status==='updated' ? 'var(--green)' : 'var(--red)';
+    st.textContent  = d.status==='updated' ? 'ok' : d.error||'err';
+  } catch(e){ st.style.color='var(--red)'; st.textContent='err'; }
+  setTimeout(()=>{ st.textContent=''; }, 2500);
+}
+document.getElementById('model-input').addEventListener('keydown', e=>{
+  if(e.key==='Enter') applyModel();
 });
 
-// uptime counter
+// ── Uptime ────────────────────────────────────────────────────────
 let _uptime = 0;
 function fmtUptime(s) {
-  if (s < 60) return s + 's';
-  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
-  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  if(s<60) return s+'s';
+  if(s<3600) return Math.floor(s/60)+'m '+(s%60)+'s';
+  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
 }
-setInterval(() => {
-  _uptime++;
-  document.getElementById('c-uptime').textContent = fmtUptime(_uptime);
-}, 1000);
+setInterval(()=>{ _uptime++; document.getElementById('c-uptime').textContent=fmtUptime(_uptime); },1000);
 
+// ── Cards + mode table ────────────────────────────────────────────
 function setConn(ok) {
-  const dot  = document.getElementById('conn-dot');
-  const dot2 = document.getElementById('conn-dot2');
-  const lbl  = document.getElementById('conn-label');
-  [dot, dot2].forEach(d => { if (d) d.className = ok ? 'ok' : ''; });
-  lbl.textContent = ok ? 'live' : 'reconnecting...';
+  const dot=document.getElementById('conn-dot'), lbl=document.getElementById('conn-label');
+  dot.className='conn-dot'+(ok?' ok':''); lbl.textContent=ok?'live':'reconnecting…';
 }
-
 function updateCards(s) {
   document.getElementById('c-reqs').textContent  = s.total_requests;
   document.getElementById('c-saved').textContent = s.total_tokens_saved.toLocaleString();
   document.getElementById('c-ratio').textContent = s.total_requests ? s.avg_ratio.toFixed(3) : '\\u2014';
-  document.getElementById('c-reduc').textContent = s.total_requests ? s.avg_reduction_pct.toFixed(1) + '%' : '\\u2014';
+  document.getElementById('c-reduc').textContent = s.total_requests ? s.avg_reduction_pct.toFixed(1)+'%' : '\\u2014';
   _uptime = s.uptime_s;
-  document.getElementById('c-uptime').textContent = fmtUptime(s.uptime_s);
+  // dollars saved card
+  const dEl  = document.getElementById('c-dollars');
+  const dSub = document.getElementById('c-dollars-sub');
+  if (s.dollars_saved !== null && s.dollars_saved !== undefined) {
+    const v = s.dollars_saved;
+    dEl.textContent  = v < 0.001 ? '$' + v.toFixed(6) : v < 0.01 ? '$' + v.toFixed(4) : '$' + v.toFixed(4);
+    const cost = s.model_input_cost_per_1m;
+    dSub.textContent = cost !== null && cost !== undefined
+      ? `@ $${cost.toFixed(4)}/1M input tok`
+      : 'estimated savings';
+  } else {
+    dEl.textContent  = '\\u2014';
+    dSub.textContent = 'select model in Browse for pricing';
+  }
 }
-
 function updateModeTable(byMode) {
   const tbody = document.getElementById('mode-tbody');
   tbody.innerHTML = '';
-  const modes = Object.entries(byMode).sort((a,b) => b[1].count - a[1].count);
-  modes.forEach(([mode, v]) => {
-    const pct   = Math.max(0, v.avg_reduction_pct);
-    const color = pct >= 50 ? '#22c55e' : pct >= 20 ? '#eab308' : '#ef4444';
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
+  const modes = Object.entries(byMode).sort((a,b)=>b[1].count-a[1].count);
+  modes.forEach(([mode,v])=>{
+    const pct=Math.max(0,v.avg_reduction_pct);
+    const col=pct>=50?'#22c55e':pct>=20?'#eab308':'#ef4444';
+    const tr=document.createElement('tr');
+    tr.innerHTML=`
       <td><span class="mode-pill">${mode}</span></td>
-      <td>${v.count}</td>
-      <td>${v.avg_before.toLocaleString()}</td>
+      <td>${v.count}</td><td>${v.avg_before.toLocaleString()}</td>
       <td>${v.avg_after.toLocaleString()}</td>
       <td class="green">${v.avg_saved.toLocaleString()}</td>
-      <td style="color:${color}">${v.avg_reduction_pct > 0 ? '-' : '+'}${Math.abs(v.avg_reduction_pct)}%</td>
-      <td><div class="bar-wrap"><div class="bar" style="width:${Math.min(100,pct)}%;background:${color}"></div></div></td>
-    `;
+      <td style="color:${col}">${v.avg_reduction_pct>0?'-':'+'}${Math.abs(v.avg_reduction_pct)}%</td>
+      <td><div class="bar-wrap"><div class="bar" style="width:${Math.min(100,pct)}%;background:${col}"></div></div></td>`;
     tbody.appendChild(tr);
   });
-  if (!modes.length) {
-    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:16px 10px">No requests yet</td></tr>';
-  }
+  if(!modes.length) tbody.innerHTML='<tr><td colspan="7" style="color:var(--muted);padding:12px 8px">No requests yet</td></tr>';
 }
 
-let _ctxData = {raw: '', transformed: ''};
-let _ctxView  = 'raw';
-
-function switchView(which) {
-  _ctxView = which;
-  document.getElementById('modal-ctx').textContent = _ctxData[which] || '(empty)';
-  document.getElementById('btn-raw').style.opacity         = which === 'raw'         ? '1' : '0.45';
-  document.getElementById('btn-transformed').style.opacity = which === 'transformed' ? '1' : '0.45';
-  document.getElementById('modal-title').textContent =
-    which === 'raw' ? 'Original Context' : 'Modified Context (wrapper output)';
-}
-
-async function openCtx(reqId, mode, model) {
-  const overlay = document.getElementById('modal-overlay');
-  document.getElementById('modal-meta').textContent = `${reqId}  \\u00b7  mode: ${mode}  \\u00b7  model: ${model}`;
-  document.getElementById('modal-ctx').textContent  = 'loading...';
-  _ctxData = {raw: '', transformed: ''};
-  overlay.classList.add('open');
-  switchView('raw');
-  try {
-    const r = await fetch(`/v1/requests/${reqId}/context`);
-    const d = await r.json();
-    _ctxData.raw         = d.raw         || '(empty)';
-    _ctxData.transformed = d.transformed || '(empty)';
-    document.getElementById('modal-ctx').textContent = _ctxData[_ctxView];
-  } catch(e) {
-    document.getElementById('modal-ctx').textContent = 'Error loading context.';
-  }
-}
-
-function closeModal(e) {
-  if (e && e.target !== document.getElementById('modal-overlay')) return;
-  document.getElementById('modal-overlay').classList.remove('open');
-}
-
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') document.getElementById('modal-overlay').classList.remove('open');
-});
-
+// ── Feed ──────────────────────────────────────────────────────────
 function addFeedRow(e) {
-  const container = document.getElementById('feed-rows');
-  const pctColor  = e.reduction_pct >= 50 ? '#22c55e' : e.reduction_pct >= 20 ? '#eab308' : '#ef4444';
-  const modelShort = (e.model || '').split('/').pop() || e.model || '—';
-  const reqId = e.request_id || '';
-  const mode  = e.mode || '—';
-  const model = e.model || '—';
-  const row = document.createElement('div');
-  row.className = 'feed-row new';
-  row.innerHTML = `
+  const container=document.getElementById('feed-rows');
+  const pctColor=e.reduction_pct>=50?'#22c55e':e.reduction_pct>=20?'#eab308':'#ef4444';
+  const modelShort=(e.model||'').split('/').pop()||'—';
+  const reqId=e.request_id||'', mode=e.mode||'—', model=e.model||'—';
+  const row=document.createElement('div');
+  row.className='feed-row new';
+  row.innerHTML=`
     <span style="color:var(--muted)">${e.ts}</span>
     <span><span class="mode-pill">${mode}</span></span>
-    <span style="color:var(--muted);font-size:10px" title="${model}">${modelShort}</span>
+    <span style="color:var(--muted);font-size:9px" title="${model}">${modelShort}</span>
     <span>${e.tok_before.toLocaleString()}</span>
     <span>${e.tok_after.toLocaleString()}</span>
     <span class="green">${e.tok_saved.toLocaleString()}</span>
-    <span style="color:${pctColor}">${e.reduction_pct > 0 ? '-' : '+'}${Math.abs(e.reduction_pct)}%</span>
-    <span>${reqId ? `<button class="btn sm" onclick="openCtx('${reqId}','${mode}','${model.replace(/'/g,"\\\\'")}')">view</button>` : '—'}</span>
-  `;
-  container.insertBefore(row, container.firstChild);
-  while (container.children.length > 50) container.removeChild(container.lastChild);
-  document.getElementById('sb-last').textContent =
-    `last: ${mode} (${modelShort}) — saved ${e.tok_saved} tokens (${e.reduction_pct > 0 ? '-' : '+'}${Math.abs(e.reduction_pct)}%)`;
+    <span style="color:${pctColor}">${e.reduction_pct>0?'-':'+'}${Math.abs(e.reduction_pct)}%</span>
+    <span>${reqId?`<button class="btn sm" onclick="openCtx('${reqId}','${mode}','${model.replace(/'/g,"\\\\'")}')">view</button>`:'—'}</span>`;
+  container.insertBefore(row,container.firstChild);
+  while(container.children.length>50) container.removeChild(container.lastChild);
+  document.getElementById('sb-last-top').textContent=
+    `${mode} (${modelShort}) — saved ${e.tok_saved.toLocaleString()} tok`;
 }
 
-// SSE
-function connect() {
-  const es = new EventSource('/v1/stats/stream');
-  es.onopen  = () => setConn(true);
-  es.onerror = () => { setConn(false); es.close(); setTimeout(connect, 3000); };
-  es.onmessage = (ev) => {
-    try {
-      const msg = JSON.parse(ev.data);
+// ── Models browser ────────────────────────────────────────────────
+let _allModels=[],_sortKey='id',_sortAsc=true;
+function costClass(v){if(v===null||v===undefined)return '';if(v===0)return 'cost-free';if(v<0.5)return 'cost-cheap';if(v<5)return 'cost-mid';return 'cost-expensive';}
+function fmtCost(v){if(v===null||v===undefined)return '<span style="color:var(--muted)">—</span>';if(v===0)return '<span class="cost-free">free</span>';return `<span class="${costClass(v)}">$${v.toFixed(4)}</span>`;}
+function fmtCtx(v){if(!v)return '<span style="color:var(--muted)">—</span>';return v>=1000?(v/1000).toFixed(0)+'K':v;}
+function renderModels(){
+  const q=(document.getElementById('models-search').value||'').toLowerCase();
+  const tbody=document.getElementById('models-tbody');
+  let rows=_allModels.filter(m=>!q||m.id.toLowerCase().includes(q)||(m.name||'').toLowerCase().includes(q));
+  rows.sort((a,b)=>{
+    let av=a[_sortKey],bv=b[_sortKey];
+    if(av===null||av===undefined)av=_sortAsc?Infinity:-Infinity;
+    if(bv===null||bv===undefined)bv=_sortAsc?Infinity:-Infinity;
+    if(typeof av==='string')return _sortAsc?av.localeCompare(bv):bv.localeCompare(av);
+    return _sortAsc?av-bv:bv-av;
+  });
+  tbody.innerHTML=rows.map(m=>{
+    const cost = m.input_cost_per_1m !== null && m.input_cost_per_1m !== undefined ? m.input_cost_per_1m : 'null';
+    return `<tr onclick="selectModel('${m.id.replace(/'/g,"\\\\'")}', ${cost})">
+      <td style="color:var(--accent);font-size:10px">${m.id}</td>
+      <td style="color:var(--muted);font-size:9px">${m.name!==m.id?m.name:''}</td>
+      <td class="cost-cell" style="color:var(--muted)">${fmtCtx(m.context_length)}</td>
+      <td class="cost-cell">${fmtCost(m.input_cost_per_1m)}</td>
+      <td class="cost-cell">${fmtCost(m.output_cost_per_1m)}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('models-status').textContent=`${rows.length} model${rows.length!==1?'s':''} — click to select`;
+}
+function filterModels(){renderModels();}
+function sortModels(key){if(_sortKey===key)_sortAsc=!_sortAsc;else{_sortKey=key;_sortAsc=true;}renderModels();}
+function selectModel(id, inputCostPer1m) {
+  document.getElementById('model-input').value = id;
+  closeModelsBrowser();
+  // pass pricing to server so dollar savings can be calculated
+  const body = {model: id};
+  if (inputCostPer1m !== null && inputCostPer1m !== undefined) body.input_cost_per_1m = inputCostPer1m;
+  const st = document.getElementById('model-status');
+  st.style.color = 'var(--yellow)'; st.textContent = '…';
+  fetch('/v1/config/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(r => r.json())
+    .then(d => {
+      st.style.color = d.status === 'updated' ? 'var(--green)' : 'var(--red)';
+      st.textContent  = d.status === 'updated' ? 'ok' : d.error || 'err';
+      setTimeout(() => { st.textContent = ''; }, 2500);
+    })
+    .catch(() => { st.style.color = 'var(--red)'; st.textContent = 'err'; });
+}
+async function openModelsBrowser(){
+  const providerUrl = currentSelectedUrl();
+  document.getElementById('models-overlay').classList.add('open');
+  document.getElementById('models-tbody').innerHTML='';
+  document.getElementById('models-search').value='';
+  const providerName = (() => {
+    const sel = document.getElementById('s-provider');
+    const match = Array.from(sel.options).find(o => o.value === providerUrl);
+    return match ? match.textContent.replace(/[✓⚠]/g,'').trim() : (providerUrl || 'upstream');
+  })();
+  document.getElementById('models-status').textContent = `Fetching models from ${providerName}…`;
+  try{
+    const qs = providerUrl ? '?url=' + encodeURIComponent(providerUrl) : '';
+    const r = await fetch('/v1/upstream/models' + qs);
+    const d = await r.json();
+    if(d.error){document.getElementById('models-status').textContent='Error: '+d.error;return;}
+    _allModels=d.data||[];
+    renderModels();
+  }catch(e){document.getElementById('models-status').textContent='Network error: '+e.message;}
+}
+function closeModelsBrowser(e){if(e&&e.target!==document.getElementById('models-overlay'))return;document.getElementById('models-overlay').classList.remove('open');}
+
+// ── Context viewer ────────────────────────────────────────────────
+let _ctxData={raw:'',transformed:''},_ctxView='raw';
+function switchView(which){
+  _ctxView=which;
+  document.getElementById('modal-ctx').textContent=_ctxData[which]||'(empty)';
+  document.getElementById('btn-raw').style.opacity=which==='raw'?'1':'.45';
+  document.getElementById('btn-transformed').style.opacity=which==='transformed'?'1':'.45';
+  document.getElementById('modal-title').textContent=which==='raw'?'Original Context':'Modified Context (wrapper output)';
+}
+async function openCtx(reqId,mode,model){
+  const overlay=document.getElementById('modal-overlay');
+  document.getElementById('modal-meta').textContent=`${reqId} · mode: ${mode} · model: ${model}`;
+  document.getElementById('modal-ctx').textContent='loading…';
+  _ctxData={raw:'',transformed:''};
+  overlay.classList.add('open'); switchView('raw');
+  try{
+    const r=await fetch(`/v1/requests/${reqId}/context`);
+    const d=await r.json();
+    _ctxData.raw=d.raw||'(empty)'; _ctxData.transformed=d.transformed||'(empty)';
+    document.getElementById('modal-ctx').textContent=_ctxData[_ctxView];
+  }catch(e){document.getElementById('modal-ctx').textContent='Error loading context.';}
+}
+function closeModal(e){if(e&&e.target!==document.getElementById('modal-overlay'))return;document.getElementById('modal-overlay').classList.remove('open');}
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){
+    document.getElementById('models-overlay').classList.remove('open');
+    document.getElementById('modal-overlay').classList.remove('open');
+  }
+});
+
+// ── SSE ───────────────────────────────────────────────────────────
+function connect(){
+  const es=new EventSource('/v1/stats/stream');
+  es.onopen=()=>setConn(true);
+  es.onerror=()=>{setConn(false);es.close();setTimeout(connect,3000);};
+  es.onmessage=(ev)=>{
+    try{
+      const msg=JSON.parse(ev.data);
       updateCards(msg.stats);
       updateModeTable(msg.stats.by_mode);
-      if (msg.latest) addFeedRow(msg.latest);
-    } catch(e) {}
+      if(msg.latest)addFeedRow(msg.latest);
+    }catch(e){}
   };
 }
 
+loadSettings();
 connect();
 updateModeTable({});
 </script>
