@@ -1,0 +1,16 @@
+I need to choose the framework for the project's new API. Compare FastAPI, Django REST Framework, and Flask-RESTX using these criteria:
+
+1. Performance (requests/second in typical benchmarks)
+2. Development speed and learning curve
+3. Automatic documentation (OpenAPI/Swagger)
+4. Native async/await support
+5. Ecosystem and available libraries
+6. Maturity and community support
+7. Testing
+8. Deployment and containerization
+
+The team has 3 developers with intermediate Python experience, no Django experience, and good knowledge of async Python.
+
+The project is a REST API for a booking system with about 50 endpoints, PostgreSQL and Redis integration, JWT authentication, and expected traffic of about 500-1000 requests/minute.
+
+Provide a structured comparison and a final recommendation.

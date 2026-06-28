@@ -1,0 +1,40 @@
+{
+  "name": "html_landing_page",
+  "description": "5-turn coding agent: build a complex single-file HTML landing page",
+  "task_type": "generation",
+  "artifact_extension": "html",
+  "turns": [
+    {
+      "label": "Core structure",
+      "content": "Create a complete, single-file HTML landing page for a SaaS product called 'FlowOS'. Requirements:\n1. Sticky navbar: logo (text), links to #features #pricing #contact, a 'Get Started' CTA button.\n2. Hero section: animated CSS gradient background (shifting hues, keyframe animation), large H1 headline 'Ship faster. Break nothing.', subtitle, two CTA buttons ('Start free' primary, 'See demo' ghost).\n3. Features section (#features): 2x2 grid of 4 cards, each with an inline SVG icon, title, and 2-line description. Topics: Fast deploy, Real-time logs, Auto-scaling, Zero downtime.\n4. Pricing section (#pricing): 3 tiers — Starter $9/mo, Pro $29/mo (visually highlighted with accent border/badge), Enterprise (custom price). Each tier: 5 feature bullets, a CTA button.\nUse a dark color scheme: background #0a0a0f, cards #13131a, accent #6c63ff, text #e2e2e2. No external dependencies. Embed all CSS in <style>. Output only the complete HTML file."
+    },
+    {
+      "label": "Counters & animations",
+      "content": "Extend the HTML page with:\n1. A stats bar section between the hero and features: three counters — '10,000+ Users', '99.9% Uptime', '150+ Integrations'. Each counter should animate from 0 to its target number when it scrolls into view (use IntersectionObserver). Show the label below each number.\n2. Smooth scroll behavior when clicking any navbar anchor link (CSS scroll-behavior: smooth is fine).\n3. Feature card hover animation: translateY(-6px) and a stronger box-shadow. Transition 0.25s ease.\nReturn the complete updated HTML file."
+    },
+    {
+      "label": "Dark/light mode toggle",
+      "content": "Add a dark/light mode toggle to the page:\n1. Add a toggle button in the navbar (before the CTA). Use a moon icon (🌙) for dark, sun (☀️) for light as button text/label.\n2. Implement via CSS custom properties: define all colors as var(--bg), var(--card), var(--text), var(--accent) etc. on :root for dark mode, override them on [data-theme='light'].\n3. Transition: add 'transition: background 0.3s ease, color 0.3s ease' to body and cards so the switch is smooth.\n4. Persist the choice in localStorage ('flowos-theme'). On page load, read it and apply before first paint (to avoid flash).\nReturn the complete updated HTML file."
+    },
+    {
+      "label": "Contact form with validation",
+      "content": "Add a contact section (#contact) before the closing </body>:\n1. Section title 'Get in touch', subtitle text.\n2. Form fields: Name (text, required), Email (email, required), Subject (select dropdown with options: General inquiry / Bug report / Partnership), Message (textarea, min 20 chars).\n3. Real-time JS validation: validate each field on 'input' and 'blur' events. Show a red error message (<span class='error'>) below the field when invalid; remove it when valid. Green border on valid fields, red border on invalid.\n4. Submit button disabled until all fields are valid. On submit: preventDefault, show a success toast notification (bottom-right, fades out after 3s).\nReturn the complete updated HTML file."
+    },
+    {
+      "label": "Pricing modal with checkout",
+      "content": "When any pricing CTA button is clicked, open a modal overlay:\n1. Backdrop: full-screen semi-transparent dark overlay with backdrop-filter: blur(4px). Click backdrop to close.\n2. Modal card (max-width 420px, centered): show plan name and price at top, then a checkout form with fields: Cardholder Name, Card Number (auto-insert a space every 4 digits as the user types, max 19 chars displayed), Expiry MM/YY (auto-insert slash after 2 digits), CVV (max 3 digits, type=password).\n3. 'Confirm Payment' button: on click, enter a loading state (show spinner, disable button, change text to 'Processing…'). After 1.5s simulate success: close modal, show a toast 'Payment successful! Welcome to FlowOS.'.\n4. Close (×) button top-right of modal. ESC key also closes.\nReturn the complete updated HTML file."
+    }
+  ],
+  "checks": [
+    {"name": "sticky navbar",        "pattern": "position:\\s*sticky|position:\\s*fixed"},
+    {"name": "gradient hero",        "pattern": "@keyframes|animation:"},
+    {"name": "IntersectionObserver", "pattern": "IntersectionObserver"},
+    {"name": "dark mode toggle",     "pattern": "data-theme|localStorage|theme.*toggle|toggleTheme"},
+    {"name": "localStorage persist", "pattern": "localStorage\\.setItem|localStorage\\.getItem"},
+    {"name": "contact form",         "pattern": "id=[\"']contact[\"']|section.*contact|<form"},
+    {"name": "form validation JS",   "pattern": "addEventListener|input.*valid|blur.*valid|checkValid"},
+    {"name": "modal/checkout",       "pattern": "modal|checkout|payment-modal|dialog|popup|openModal|showModal"},
+    {"name": "card auto-format",     "pattern": "card.*number|cardNumber|maxlength|replace\\(|split.*join"},
+    {"name": "payment spinner",      "pattern": "spinner|Processing|setTimeout|loading"}
+  ]
+}

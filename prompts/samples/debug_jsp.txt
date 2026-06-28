@@ -1,0 +1,80 @@
+I have a Tomcat 9 error on a JSP page. Here is the full server log:
+
+SEVERE: Servlet.service() for servlet [jsp] in context with path [/ev2jira] threw exception [An exception occurred processing [ev2jira_upd.jsp] at line [47]
+
+47: JSONObject response = new JSONObject();
+
+Stacktrace:] with root cause
+org.apache.jasper.JasperException: An exception occurred processing [ev2jira_upd.jsp] at line [47]
+
+Generated servlet error:
+/ev2jira_upd.jsp:47:44: error: variable response is already defined in doGet(HttpServletRequest,HttpServletResponse)
+JSONObject response = new JSONObject();
+                             ^
+1 error
+
+	at org.apache.jasper.compiler.DefaultErrorHandler.javacError(DefaultErrorHandler.java:92)
+	at org.apache.jasper.compiler.AntCompiler.generateClass(AntCompiler.java:236)
+	at org.apache.jasper.compiler.Compiler.compile(Compiler.java:373)
+	at org.apache.jasper.compiler.Compiler.compile(Compiler.java:353)
+	at org.apache.jasper.compiler.Compiler.compile(Compiler.java:340)
+	at org.apache.jasper.JspCompilationContext.compile(JspCompilationContext.java:566)
+	at org.apache.jasper.servlet.JspServletWrapper.service(JspServletWrapper.java:369)
+	at org.apache.jasper.servlet.JspServlet.serviceJspFile(JspServlet.java:395)
+	at org.apache.jasper.servlet.JspServlet.service(JspServlet.java:339)
+
+The ev2jira_upd.jsp file contains this code in the section that triggers the error:
+
+<%@ page import="org.json.JSONObject" %>
+<%@ page import="java.sql.*" %>
+
+<%
+    // Database connection
+    Connection conn = null;
+    PreparedStatement ps = null;
+    ResultSet rs = null;
+
+    // Read request parameters
+    String issueId = request.getParameter("issue_id");
+    String actionTypeId = request.getParameter("action_type_id");
+    String userId = request.getParameter("user_id");
+
+    try {
+        // Prepare query
+        conn = DataSourceUtils.getConnection(dataSource);
+        String sql = "UPDATE ev2jira_issues SET action_type_id=?, updated_by=?, updated_at=NOW() WHERE id=?";
+        ps = conn.prepareStatement(sql);
+        ps.setString(1, actionTypeId);
+        ps.setString(2, userId);
+        ps.setString(3, issueId);
+        ps.executeUpdate();
+
+        // Build JSON response
+        JSONObject response = new JSONObject();
+        response.put("action_type_id", 19);
+        response.put("status", "ok");
+        response.put("issue_id", issueId);
+
+        out.println(response.toString());
+
+    } catch (Exception e) {
+        JSONObject errorResponse = new JSONObject();
+        errorResponse.put("error", e.getMessage());
+        out.println(errorResponse.toString());
+    } finally {
+        if (rs != null) rs.close();
+        if (ps != null) ps.close();
+        if (conn != null) conn.close();
+    }
+%>
+
+The development environment is:
+- Java 8
+- Tomcat 9.0.65
+- JSP 2.3
+- Maven project
+- IDE: Eclipse 2022-09
+
+The project compiles correctly locally with OpenJDK 11, but fails on Tomcat 9 with Java 8.
+I already tried cleaning the Tomcat work directory, but the issue persists.
+Fix the JSP file and explain the problem briefly.

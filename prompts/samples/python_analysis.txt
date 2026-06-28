@@ -1,0 +1,77 @@
+I have a production FastAPI API that started returning intermittent 500 errors during the last day.
+Here are the relevant logs from the last 6 hours:
+
+[2026-06-27 14:23:11] ERROR uvicorn.error - Exception in ASGI application
+Traceback (most recent call last):
+  File "/app/api/routers/orders.py", line 87, in get_order_details
+    order = await db.execute(select(Order).where(Order.id == order_id))
+  File "/app/db/session.py", line 34, in execute
+    return await self._session.execute(statement)
+  File "/usr/local/lib/python3.11/site-packages/sqlalchemy/ext/asyncio/session.py", line 218, in execute
+    return await greenlet_spawn(self.sync_session.execute, statement, params, execution_options)
+sqlalchemy.exc.TimeoutError: QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.0
+
+[2026-06-27 14:23:15] ERROR uvicorn.error - Exception in ASGI application
+Traceback (most recent call last):
+  File "/app/api/routers/orders.py", line 87, in get_order_details
+    order = await db.execute(select(Order).where(Order.id == order_id))
+sqlalchemy.exc.TimeoutError: QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.0
+
+[2026-06-27 14:45:02] WARNING app.middleware - Request duration 12.4s for GET /api/v2/orders/8821
+
+The database configuration is:
+
+# db/session.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = "postgresql+asyncpg://user:pass@db:5432/orders_db"
+
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=1800,
+    echo=False,
+)
+
+AsyncSessionLocal = sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
+)
+
+# Orders router
+# api/routers/orders.py
+@router.get("/orders/{order_id}")
+async def get_order_details(order_id: int, db: AsyncSession = Depends(get_db)):
+    order = await db.execute(select(Order).where(Order.id == order_id))
+    order_obj = order.scalars().first()
+    if not order_obj:
+        raise HTTPException(404, "Order not found")
+
+    # Additional query for details
+    details = await db.execute(
+        select(OrderDetail).where(OrderDetail.order_id == order_id)
+    )
+    detail_list = details.scalars().all()
+
+    # Product query (potentially N+1)
+    products = []
+    for detail in detail_list:
+        product = await db.execute(
+            select(Product).where(Product.id == detail.product_id)
+        )
+        products.append(product.scalars().first())
+
+    return {"order": order_obj, "details": detail_list, "products": products}
+
+Current metrics:
+- Traffic: ~800 requests/minute during peak hours
+- DB: PostgreSQL 14, 4 CPU, 8GB RAM, SSD
+- Containers: 3 FastAPI replicas, each with pool_size=5
+
+Analyze the problem and propose the necessary fixes.

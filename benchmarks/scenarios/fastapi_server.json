@@ -1,0 +1,60 @@
+{
+  "name": "fastapi_server",
+  "description": "10-turn coding agent: build a FastAPI server from scratch to 8 production endpoints",
+  "task_type": "generation",
+  "artifact_extension": "py",
+  "turns": [
+    {
+      "label": "Basic app + /health",
+      "content": "Create a single-file FastAPI application `main.py`. Include: FastAPI app initialization with title='ItemsAPI' and version='1.0.0', a GET /health endpoint returning {\"status\": \"ok\", \"version\": \"1.0.0\"}, and a uvicorn startup block (`if __name__ == '__main__': uvicorn.run(...)`). No extra dependencies beyond fastapi and uvicorn. Output only the complete Python file."
+    },
+    {
+      "label": "Pydantic model + GET /items",
+      "content": "Extend main.py. Add a Pydantic BaseModel `Item` with fields: id (Optional[int] = None), name (str, min_length=1), description (Optional[str] = None), price (float, gt=0), in_stock (bool = True). Add an in-memory store `items_db: list[Item] = []`. Add GET /items endpoint with an optional query parameter `in_stock_only: bool = False` - when True, return only in-stock items. Return the full list otherwise. Output the complete updated file."
+    },
+    {
+      "label": "POST /items with validation",
+      "content": "Add a POST /items endpoint to main.py. It accepts an Item body (name, description, price, in_stock - no id in input). Auto-assign an incremental integer id (max existing id + 1, starting at 1). Append to items_db. Return the created item with HTTP status 201. Raise HTTPException 422 with detail 'Name cannot be empty' if name is blank after strip. Output the complete updated file."
+    },
+    {
+      "label": "GET /items/{id} + DELETE /items/{id}",
+      "content": "Add to main.py: a private helper function `_get_item_or_404(item_id: int) -> Item` that searches items_db and raises HTTPException(status_code=404, detail='Item not found') if missing. Add GET /items/{item_id} using this helper. Add DELETE /items/{item_id} that removes the item and returns Response with status_code=204. Output the complete updated file."
+    },
+    {
+      "label": "PUT /items/{id} partial update",
+      "content": "Add to main.py: a Pydantic model `ItemUpdate` with all fields optional (name: Optional[str] = None, description: Optional[str] = None, price: Optional[float] = None, in_stock: Optional[bool] = None). Add PUT /items/{item_id} that calls _get_item_or_404, then updates only the fields that are not None in the request body, and returns the updated item. Output the complete updated file."
+    },
+    {
+      "label": "SQLAlchemy + SQLite persistence",
+      "content": "Replace the in-memory list with SQLAlchemy + SQLite in main.py. Add: DATABASE_URL = 'sqlite:///./items.db', create_engine with connect_args={'check_same_thread': False}, SessionLocal = sessionmaker(...), declarative Base, an ORM class ItemDB(Base) with columns id (Integer PK autoincrement), name (String not null), description (String nullable), price (Float not null), in_stock (Boolean default True). Add Base.metadata.create_all on startup. Add a get_db() generator dependency injected via Depends. Rewrite all /items endpoints to use the DB session - keep the same API contract and HTTP status codes. Remove items_db and the old helper. Output the complete updated file."
+    },
+    {
+      "label": "JWT authentication + POST /auth/login",
+      "content": "Add JWT authentication to main.py. Use python-jose and passlib. Add at the top: SECRET_KEY = 'dev-secret-change-in-prod', ALGORITHM = 'HS256', ACCESS_TOKEN_EXPIRE_MINUTES = 30. Add a hardcoded user: FAKE_USERS = {'admin': {'username': 'admin', 'hashed_password': passlib hash of 'secret'}}. Add POST /auth/login accepting OAuth2PasswordRequestForm (username + password fields), verify credentials with passlib, raise HTTPException(401) if invalid, return {'access_token': jwt_token, 'token_type': 'bearer'}. Add create_access_token() and get_current_user() functions. Add Pydantic model TokenData and User. Output the complete updated file."
+    },
+    {
+      "label": "Protect /items endpoints + GET /auth/me",
+      "content": "Protect all /items endpoints with the get_current_user dependency in main.py. GET /items, GET /items/{id}, POST /items, PUT /items/{id}, DELETE /items/{id} - all require a valid Bearer token. GET /health stays public. Add GET /auth/me that returns the current authenticated user (uses get_current_user dependency). Output the complete updated file."
+    },
+    {
+      "label": "Rate limiting with slowapi",
+      "content": "Add rate limiting to main.py using slowapi. Add: from slowapi import Limiter, _rate_limit_exceeded_handler; from slowapi.util import get_remote_address; from slowapi.errors import RateLimitExceeded. Create limiter = Limiter(key_func=get_remote_address), attach state: app.state.limiter = limiter, add exception handler: app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler). Apply @limiter.limit('60/minute') to GET /items and GET /items/{id}. Apply @limiter.limit('10/minute') to POST /items. Add the request: Request parameter to rate-limited endpoint signatures. Output the complete updated file."
+    },
+    {
+      "label": "WebSocket + global error handler + logging",
+      "content": "Add to main.py: (1) A WebSocket endpoint at /ws/{client_id}: accept connection, send JSON welcome message {'message': 'Connected', 'client_id': client_id}, then loop receiving text - echo back {'echo': received_text}, handle WebSocketDisconnect gracefully. (2) A global exception handler for Exception (unhandled errors) returning JSONResponse({'error': 'Internal server error', 'detail': str(exc)}, status_code=500). (3) Structured logging: add logging.basicConfig at startup, add a middleware using @app.middleware('http') that logs method, path, and response status_code for every request. Output the complete updated file."
+    }
+  ],
+  "checks": [
+    {"name": "GET /health endpoint",      "pattern": "@app\\.get.*health|/health"},
+    {"name": "Pydantic BaseModel",        "pattern": "class Item.*BaseModel|BaseModel"},
+    {"name": "POST /items",               "pattern": "@app\\.post.*items"},
+    {"name": "PUT /items/{id}",           "pattern": "@app\\.put.*items"},
+    {"name": "DELETE /items/{id}",        "pattern": "@app\\.delete.*items"},
+    {"name": "SQLAlchemy / database",     "pattern": "SQLAlchemy|create_engine|sessionmaker|Session"},
+    {"name": "JWT authentication",        "pattern": "jwt|jose|OAuth2|Bearer|access_token"},
+    {"name": "Protected endpoints",       "pattern": "get_current_user|Depends.*current|current_user"},
+    {"name": "Rate limiting",             "pattern": "slowapi|Limiter|rate_limit|RateLimitExceeded"},
+    {"name": "WebSocket endpoint",        "pattern": "WebSocket|websocket|WebSocketDisconnect"}
+  ]
+}

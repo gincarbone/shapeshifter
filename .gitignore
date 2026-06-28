@@ -1,0 +1,16 @@
+.venv/
+.agents/
+.codex/
+__pycache__/
+*.pyc
+*.pyo
+.env
+USAGE.md
+specifica_context_wrapper.md
+logs/
+logs/*.jsonl
+benchmark_results/
+*.egg-info/
+dist/
+.DS_Store
+Thumbs.db
