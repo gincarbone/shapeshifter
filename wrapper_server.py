@@ -286,6 +286,37 @@ def _log(filename: str, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _content_as_str(msg: dict) -> str:
+    """Return message content as plain string.
+    Handles both string content and multimodal list content
+    (e.g. Cline's [{"type":"text","text":"..."},...] format).
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _is_agentic(messages: list[dict]) -> bool:
+    """True if any message contains tool_use or tool_result blocks.
+    These are agentic workflows (Cline writing files, running commands, etc.)
+    that must pass through uncompressed with their original structure intact.
+    """
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in ("tool_use", "tool_result"):
+                    return True
+    return False
+
+
 def _resolve_mode(request_data: dict, http_headers: dict) -> str:
     mode = http_headers.get("x-context-mode", "").strip().lower()
     if mode and mode in VALID_MODES:
@@ -297,9 +328,10 @@ def _resolve_mode(request_data: dict, http_headers: dict) -> str:
         return CONTEXT_MODE
     if AUTO_MODE:
         messages = request_data.get("messages", [])
-        raw_ctx  = " ".join(m.get("content", "") for m in messages if isinstance(m.get("content"), str))
+        raw_ctx  = " ".join(_content_as_str(m) for m in messages if _content_as_str(m))
         user_req = next(
-            (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
+            (_content_as_str(m) for m in reversed(messages) if m.get("role") == "user"),
+            ""
         )
         return choose_mode(raw_ctx, user_req)
     return "hybrid"
@@ -680,13 +712,28 @@ async def chat_completions(request: Request):
             status_code=400,
         )
 
-    headers    = dict(request.headers)
-    messages   = body.get("messages", [])
-    model      = body.get("model") or _current_model
-    temp       = float(body.get("temperature", 0.2))
-    max_tok    = int(body.get("max_tokens", MAX_OUTPUT_TOKENS))
-    stream_req = bool(body.get("stream", False))
-    mode       = _resolve_mode(body, headers)
+    headers      = dict(request.headers)
+    raw_messages = body.get("messages", [])
+    model        = body.get("model") or _current_model
+    temp         = float(body.get("temperature", 0.2))
+    max_tok      = int(body.get("max_tokens", MAX_OUTPUT_TOKENS))
+    stream_req   = bool(body.get("stream", False))
+
+    # Detect agentic tool-call workflows (Cline writing files, running commands…).
+    # These messages have list content with tool_use / tool_result blocks.
+    # Compressing them destroys the tool call chain — force raw passthrough.
+    agentic = _is_agentic(raw_messages)
+    if agentic:
+        messages = raw_messages          # keep original structure intact
+        mode     = "raw"                 # bypass all compression
+    else:
+        # Normalize multimodal text-only list content to plain strings.
+        messages = [
+            {**m, "content": _content_as_str(m)}
+            if not isinstance(m.get("content", ""), str) else m
+            for m in raw_messages
+        ]
+        mode = _resolve_mode(body, headers)
 
     if mode not in VALID_MODES:
         return JSONResponse(

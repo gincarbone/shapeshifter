@@ -77,41 +77,38 @@ def _infer_task(text: str) -> str:
     return "general"
 
 
+_CODE_SIGNALS = re.compile(
+    r'(?:'
+    r'```\w*\s*\n'
+    r'|def\s+\w+[\s(]|function\s+\w+\s*\(|fn\s+\w+\s*\('
+    r'|fun\s+\w+\s*\(|func\s+\w+\s*\(|sub\s+\w+\s*\(|proc\s+\w+\s*\('
+    r'|class\s+\w+|struct\s+\w+|interface\s+\w+|enum\s+\w+'
+    r'|impl\s+\w+|trait\s+\w+'
+    r'|import\s+\w+|from\s+\w+\s+import|require\s*\(|include\s+[<"]'
+    r'|use\s+\w+::|using\s+\w+|extern\s+crate'
+    r'|const\s+\w+\s*=|let\s+\w+\s*=|var\s+\w+\s*='
+    r'|#include|#define|package\s+\w+|namespace\s+\w+'
+    r'|<!DOCTYPE|<html\b|<\?php|<\?xml'
+    r')',
+    re.IGNORECASE,
+)
+
+
 def _is_coding_session(context: str) -> bool:
-    """True when the context contains a multi-turn coding exchange in any language.
+    """True only when a previous ASSISTANT turn already contains generated code.
 
-    Detection is language-agnostic: we look for fenced code blocks (``` with any
-    tag or none) or universal programming constructs rather than listing every
-    language explicitly.
+    Checks [ASSISTANT] blocks specifically — not the whole context — to avoid
+    false positives when workspace files or user-pasted snippets contain code
+    but the conversation itself is a fresh first-turn generation request.
     """
-    if not re.search(r'\[USER\]|\[ASSISTANT\]', context):
-        return False
+    if not re.search(r'\[ASSISTANT\]', context):
+        return False  # no assistant turn yet → not a multi-turn coding session
 
-    # Any fenced code block (``` optionally followed by a language name)
-    if re.search(r'```\w*\s*\n', context):
-        return True
-
-    # Universal programming constructs present in virtually every language
-    code_signals = re.compile(
-        r'(?:'
-        # Function / method definitions (parens optional — e.g. Ruby `def greet`)
-        r'def\s+\w+[\s(]|function\s+\w+\s*\(|fn\s+\w+\s*\('
-        r'|fun\s+\w+\s*\(|func\s+\w+\s*\(|sub\s+\w+\s*\(|proc\s+\w+\s*\('
-        # Class / struct / interface declarations
-        r'|class\s+\w+|struct\s+\w+|interface\s+\w+|enum\s+\w+'
-        r'|impl\s+\w+|trait\s+\w+'
-        # Import / module statements
-        r'|import\s+\w+|from\s+\w+\s+import|require\s*\(|include\s+[<"]'
-        r'|use\s+\w+::|using\s+\w+|extern\s+crate'
-        # Common declarations and operators
-        r'|const\s+\w+\s*=|let\s+\w+\s*=|var\s+\w+\s*='
-        r'|#include|#define|package\s+\w+|namespace\s+\w+'
-        # Markup / template roots
-        r'|<!DOCTYPE|<html\b|<\?php|<\?xml'
-        r')',
-        re.IGNORECASE,
+    assistant_blocks = re.findall(
+        r'\[ASSISTANT\]\n([\s\S]*?)(?=\n\n\[(?:USER|ASSISTANT)\]|$)',
+        context,
     )
-    return bool(code_signals.search(context))
+    return any(_CODE_SIGNALS.search(block) for block in assistant_blocks)
 
 
 def _extract_user_requirements(context: str) -> list[str]:
@@ -177,13 +174,12 @@ def transform_minimal(context: str) -> str:
 
 
 def transform_yaml(context: str) -> str:
-    # For multi-turn coding sessions: emit requirements as yaml list, skip code blobs
+    # For multi-turn coding sessions: requirements list only, no task/stack inference
+    # (task inference also scans workspace context and produces false positives).
     if _is_coding_session(context):
         reqs = _extract_user_requirements(context)
-        task = _infer_task(context)
         data: dict = {
             "context_mode": "yaml",
-            "task": task,
             "cumulative_requirements": reqs,
             "constraint": "Return COMPLETE file. All requirements must be present.",
         }
@@ -252,22 +248,22 @@ def transform_table(context: str) -> str:
 
 
 def transform_hybrid(context: str) -> str:
-    # For multi-turn coding sessions: structured requirements list + tech stack
+    # For multi-turn coding sessions: requirements only, no stack inference.
+    # Stack detection scans the whole context including workspace files sent by
+    # the client, which causes false positives (e.g. ShapeShifter's own Python
+    # source appears in context when the user asks to create a JSP).
     if _is_coding_session(context):
         reqs = _extract_user_requirements(context)
-        stack = _infer_stack(context)
         parts = [
             "context_mode: hybrid",
             "",
-            f"task: generation",
-            f"  constraint: return COMPLETE file, all requirements must be present",
+            "task: generation",
+            "  constraint: return COMPLETE file, all requirements must be present",
             "",
             "cumulative_requirements:",
         ]
         for i, r in enumerate(reqs, 1):
             parts.append(f"  [{i}]: {r}")
-        if stack:
-            parts += ["", "environment:", "  stack: " + ", ".join(stack)]
         return "\n".join(parts)
 
     task = _infer_task(context)
