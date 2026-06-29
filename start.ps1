@@ -23,6 +23,7 @@ if (-not (Test-Path $py)) {
     Write-Host '[ContextZip] Installing dependencies...' -ForegroundColor Cyan
     & $py -m pip install --upgrade pip --quiet 2>$null
     & $py -m pip install -r requirements.txt --quiet
+    (Get-Date).ToString() | Out-File $stampFile -Encoding utf8
     Write-Host '[ContextZip] Dependencies installed.' -ForegroundColor Green
 }
 
@@ -49,3 +50,4 @@ if (-not (Test-Path $envFile)) {
 Write-Host ''
 Write-Host '[ContextZip] Starting server...' -ForegroundColor Green
 & $py wrapper_server.py
+
