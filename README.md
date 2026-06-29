@@ -373,6 +373,8 @@ The core idea — structural reformulation of conversation context rather than l
 
 If you build on ShapeShifter, attribution in your README or documentation is appreciated.
 
+The idea is entirely human, as are the various attempts to conceptualize, synthesize, visualize, and rationalize the context. The code made heavy use of vibecoding (70% - 75%) and rework until the final result.
+Shapeshifter is still in the testing phase. Please report any anomalies or usability issues. I apologize in advance for any problems.
 ---
 
 ## License
