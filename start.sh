@@ -29,6 +29,7 @@ if [ ! -f "$PY" ]; then
     echo "[ContextZip] Installing dependencies..."
     "$PY" -m pip install --upgrade pip --quiet
     "$PY" -m pip install -r requirements.txt --quiet
+    touch "$STAMP"
     echo "[ContextZip] Dependencies installed."
 fi
 
@@ -50,3 +51,4 @@ fi
 echo ""
 echo "[ContextZip] Starting server..."
 exec "$PY" wrapper_server.py
+
