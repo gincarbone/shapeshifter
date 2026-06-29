@@ -71,7 +71,22 @@ Key properties:
 ```bash
 git clone https://github.com/your-username/shapeshifter.git
 cd shapeshifter
+```
 
+The start scripts handle everything automatically (virtual environment creation, dependency installation, `.env` setup). Just run the one that matches your platform — no manual setup needed.
+
+| Platform | Command |
+|---|---|
+| Windows (cmd) | `start.bat` |
+| Windows (PowerShell) | `.\start.ps1` |
+| macOS / Linux | `bash start.sh` |
+
+On first run the script creates a local `.venv`, installs all dependencies, and copies `.env.example` to `.env`. On subsequent runs it only reinstalls if `requirements.txt` has changed.
+
+<details>
+<summary>Manual setup (optional)</summary>
+
+```bash
 python -m venv .venv
 
 # Windows
@@ -80,7 +95,11 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements.txt
+cp .env.example .env   # then edit .env
+python wrapper_server.py
 ```
+
+</details>
 
 **Dependencies:** `fastapi`, `uvicorn`, `httpx`, `python-dotenv`, `tiktoken`, `pyyaml`
 
@@ -132,8 +151,17 @@ The mode can be overridden per-request via:
 
 ## First Run
 
-```bash
-python wrapper_server.py
+Edit `.env` to set `UPSTREAM_API_KEY` and `UPSTREAM_BASE_URL`, then launch the start script for your platform:
+
+```
+# Windows (cmd)
+start.bat
+
+# Windows (PowerShell)
+.\start.ps1
+
+# macOS / Linux
+bash start.sh
 ```
 
 ```
@@ -354,3 +382,4 @@ MIT License © 2026 Marcello Incarbone
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, subject to the condition that the above copyright notice and this permission notice are included in all copies or substantial portions of the Software.
 
 See the [LICENSE](LICENSE) file for the full text.
+
