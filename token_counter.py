@@ -5,7 +5,7 @@ try:
     import tiktoken
     _enc = tiktoken.get_encoding("cl100k_base")
     def count_tokens(text: str) -> int:
-        return len(_enc.encode(text))
+        return len(_enc.encode(text, disallowed_special=()))
 except Exception:
     def count_tokens(text: str) -> int:  # type: ignore[misc]
         return max(1, len(text) // 4)
