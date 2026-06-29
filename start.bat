@@ -4,7 +4,6 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 set "VENV=%SCRIPT_DIR%.venv"
 set "PYTHON=%VENV%\Scripts\python.exe"
-set "PIP=%VENV%\Scripts\pip.exe"
 
 cd /d "%SCRIPT_DIR%"
 
@@ -17,11 +16,12 @@ if not exist "%VENV%\Scripts\activate.bat" (
         pause
         exit /b 1
     )
-    echo [ContextZip] Installing dependencies...
-    "%PYTHON%" -m pip install --upgrade pip --quiet
-    "%PYTHON%" -m pip install -r requirements.txt --quiet
-    echo [ContextZip] Dependencies installed.
 )
+
+:: Always ensure dependencies are installed/up to date
+echo [ContextZip] Ensuring dependencies...
+"%PYTHON%" -m pip install --upgrade pip --quiet
+"%PYTHON%" -m pip install -r requirements.txt --quiet
 
 :: Create .env if missing
 if not exist "%SCRIPT_DIR%.env" (
