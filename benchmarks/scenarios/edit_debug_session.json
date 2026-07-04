@@ -1,0 +1,44 @@
+{
+  "name": "edit_debug_session",
+  "description": "Adversarial scenario: 2 build turns, then 4 edit/debug turns that reference exact current code (names, log format, structure) instead of restating requirements — the case drop-all history cannot pass by construction.",
+  "task_type": "generation",
+  "artifact_extension": "py",
+  "turns": [
+    {
+      "label": "Build Calculator class",
+      "content": "Create calc.py with a class `Calculator` that has methods add(a,b), subtract(a,b), multiply(a,b), divide(a,b), each returning the numeric result. Keep an instance attribute `self.history: list[str]` and after every operation append a string in the exact format `f\"{a} {op_symbol} {b} = {result}\"` (e.g. `10 + 3 = 13`) where op_symbol is +, -, *, or /. Add a demo block `if __name__ == '__main__':` that creates a Calculator, calls all four operations with (10, 3), then prints each entry in history on its own line. Output only the complete Python file."
+    },
+    {
+      "label": "Add reset method",
+      "content": "Add a method `reset_history(self)` to Calculator that clears `self.history`. In the demo block, call `reset_history()` after the four initial operations, then call `add(1, 1)` once more and print history again to show it only contains the new entry. Output the complete updated file."
+    },
+    {
+      "label": "Custom exception for divide-by-zero",
+      "content": "In calc.py, define a custom exception class `DivisionByZeroError(Exception)`. Change `divide` so that when `b == 0` it raises `DivisionByZeroError` with the message `\"Cannot divide by zero\"` instead of letting a raw ZeroDivisionError propagate. Do not change the behavior of add/subtract/multiply. Output the complete updated file."
+    },
+    {
+      "label": "Rename history everywhere",
+      "content": "Rename the `history` attribute to `operation_log` everywhere it is referenced in calc.py — the attribute itself, every method that appends to it, and the demo block. Also rename the `reset_history` method to `reset_operation_log`. There should be no remaining reference to the old name `history` anywhere in the file. Output the complete updated file."
+    },
+    {
+      "label": "Add power() reusing multiply",
+      "content": "Add a method `power(self, a, b)` to Calculator for non-negative integer exponents `b`, computed by repeated calls to `self.multiply` in a loop (no `**` or `pow()`), starting from a result of 1. Log it to `operation_log` using the exact same string format the other methods use, with `^` as the operator symbol. Output the complete updated file."
+    },
+    {
+      "label": "Harden the demo block only",
+      "content": "Without changing any Calculator method, update only the demo block at the bottom of calc.py: wrap each of the four original operation calls (add, subtract, multiply, divide) in its own try/except that catches `DivisionByZeroError` specifically and prints `f\"Error: {e}\"` when it happens. Also add a call to `power(10, 3)` in the demo block. Output the complete updated file."
+    }
+  ],
+  "checks": [
+    {"name": "Calculator class defined",            "pattern": "class\\s+Calculator"},
+    {"name": "add/subtract/multiply/divide present", "pattern": "def\\s+add\\(.*def\\s+subtract\\(.*def\\s+multiply\\(.*def\\s+divide\\("},
+    {"name": "renamed attribute operation_log used", "pattern": "operation_log"},
+    {"name": "renamed method reset_operation_log",   "pattern": "def\\s+reset_operation_log"},
+    {"name": "custom DivisionByZeroError defined",   "pattern": "class\\s+DivisionByZeroError\\s*\\(\\s*Exception\\s*\\)"},
+    {"name": "divide raises DivisionByZeroError",    "pattern": "raise\\s+DivisionByZeroError"},
+    {"name": "power() method added",                 "pattern": "def\\s+power\\("},
+    {"name": "power() reuses multiply (no **/pow)",  "pattern": "def\\s+power\\([^)]*\\)\\s*(?:->\\s*[\\w\\[\\], ]+)?\\s*:[\\s\\S]{0,400}?self\\.multiply"},
+    {"name": "demo catches DivisionByZeroError",      "pattern": "except\\s+DivisionByZeroError"},
+    {"name": "demo calls power(10, 3)",               "pattern": "power\\(\\s*10\\s*,\\s*3\\s*\\)"}
+  ]
+}

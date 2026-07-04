@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator
@@ -17,7 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from llm_client import call_upstream
+from llm_client import call_upstream, stream_upstream
 from mode_selector import choose_mode
 from output_contracts import build_system_prompt, detect_contract_type
 from token_counter import compression_stats, count_tokens
@@ -29,10 +31,15 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 
+# Placeholder shipped in .env.example — never treat this as a real key.
+_PLACEHOLDER_KEY  = "your-api-key-here"
+
 HOST              = os.getenv("WRAPPER_HOST", "127.0.0.1")
 PORT              = int(os.getenv("WRAPPER_PORT", "8787"))
 UPSTREAM_URL      = os.getenv("UPSTREAM_BASE_URL", "")
 UPSTREAM_KEY      = os.getenv("UPSTREAM_API_KEY", "")
+if UPSTREAM_KEY == _PLACEHOLDER_KEY:
+    UPSTREAM_KEY = ""
 DEFAULT_MODEL     = os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat")
 CONTEXT_MODE      = os.getenv("CONTEXT_MODE", "hybrid")
 AUTO_MODE         = os.getenv("AUTO_MODE", "false").lower() == "true"
@@ -115,6 +122,13 @@ def _save_provider_keys() -> None:
 
 
 _load_provider_keys()
+
+# Adopt a previously-saved key for the active provider if .env didn't supply
+# one (e.g. .env still has the placeholder, but a real key was saved earlier
+# via the dashboard and persisted to .shapeshifter_keys.json).
+if UPSTREAM_URL and not UPSTREAM_KEY and UPSTREAM_URL in _provider_keys:
+    UPSTREAM_KEY = _provider_keys[UPSTREAM_URL]
+    _config["upstream_api_key"] = UPSTREAM_KEY
 
 
 def _key_status(url: str) -> str:
@@ -303,18 +317,110 @@ def _content_as_str(msg: dict) -> str:
     return ""
 
 
-def _is_agentic(messages: list[dict]) -> bool:
-    """True if any message contains tool_use or tool_result blocks.
-    These are agentic workflows (Cline writing files, running commands, etc.)
-    that must pass through uncompressed with their original structure intact.
+def _is_agentic(messages: list[dict], body: dict | None = None) -> bool:
+    """True for tool-calling / function-calling exchanges — OpenAI-style
+    (assistant `tool_calls`, `role: tool`/`function`) or Anthropic-style
+    content blocks (`tool_use` / `tool_result`), or a request that declares
+    `tools`/`tool_choice`. These must pass through uncompressed with their
+    original structure intact, or the model loses the ability to correlate
+    tool calls with their results.
     """
+    if body and (body.get("tools") or body.get("tool_choice")):
+        return True
     for m in messages:
+        if m.get("role") in ("tool", "function"):
+            return True
+        if m.get("tool_calls") or m.get("function_call"):
+            return True
         content = m.get("content", "")
         if isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") in ("tool_use", "tool_result"):
                     return True
     return False
+
+
+_FILE_READ_TOOL_NAME = re.compile(r"read.*file|get.*file.*content|cat_file|file_read", re.IGNORECASE)
+_FILE_PATH_ARG_KEYS = ("path", "file_path", "filepath", "file", "filename", "target_file")
+
+
+def _build_tool_call_paths(messages: list[dict]) -> dict[str, str]:
+    """Map tool_call_id -> file path, for tool calls that look like file reads
+    (by function name) and whose arguments carry a recognizable path
+    parameter. Used only to identify *which file* a `tool` result answers, so
+    an unmodified re-read of the same file can be recognized safely — never
+    to guess at content we can't verify.
+    """
+    paths: dict[str, str] = {}
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            name = fn.get("name", "")
+            if not _FILE_READ_TOOL_NAME.search(name):
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(args, dict):
+                continue
+            for key in _FILE_PATH_ARG_KEYS:
+                if isinstance(args.get(key), str):
+                    paths[tc.get("id", "")] = args[key]
+                    break
+    return paths
+
+
+def _dedupe_repeated_tool_file_reads(messages: list[dict]) -> list[dict]:
+    """Within a single agentic request, if a file-read tool call returns
+    content for a file that gets read again later in this same message
+    list, keep only the LAST occurrence in full and replace every earlier
+    one with a short marker — whether or not the content actually changed
+    between reads. This mirrors the same "latest wins" retention already
+    applied to assistant/user code in transformers.py
+    (`_extract_latest_artifacts`): only the current state of a file is
+    needed to act on it now, so an earlier read — identical or since
+    superseded — doesn't need to stay in full once a later read of the same
+    path exists.
+
+    Messages that aren't `tool` role, or tool calls that don't look like a
+    file read (no resolvable path — see `_build_tool_call_paths`), are left
+    completely untouched. The size guard still applies: a marker never
+    replaces content it isn't actually shorter than.
+    """
+    tool_paths = _build_tool_call_paths(messages)
+    if not tool_paths:
+        return messages
+
+    last_index_for_path: dict[str, int] = {}
+    for i, m in enumerate(messages):
+        if m.get("role") != "tool" or not isinstance(m.get("content"), str):
+            continue
+        path = tool_paths.get(m.get("tool_call_id", ""))
+        if path:
+            last_index_for_path[path] = i
+
+    new_messages: list[dict] = []
+    for i, m in enumerate(messages):
+        if m.get("role") != "tool" or not isinstance(m.get("content"), str):
+            new_messages.append(m)
+            continue
+        path = tool_paths.get(m.get("tool_call_id", ""))
+        if path and last_index_for_path.get(path) != i:
+            unchanged = m["content"] == messages[last_index_for_path[path]].get("content")
+            marker = (
+                f"[{path} unchanged since earlier read — content omitted]" if unchanged
+                else f"[{path} read here — since superseded by a later version shown further below]"
+            )
+            # Never replace with something that isn't actually smaller — for a
+            # tiny file the marker itself can outweigh the content it'd replace.
+            if len(marker) < len(m["content"]):
+                new_messages.append({**m, "content": marker})
+                continue
+        new_messages.append(m)
+    return new_messages
 
 
 def _resolve_mode(request_data: dict, http_headers: dict) -> str:
@@ -340,33 +446,59 @@ def _resolve_mode(request_data: dict, http_headers: dict) -> str:
 def _build_compressed_messages(
     original_messages: list[dict], mode: str
 ) -> tuple[list[dict], str, str]:
-    # Separate history (all but last user message) from the current user request.
-    # Only history is compressed — the current user message is always sent intact
-    # so pasted code, file contents, or inline examples are never stripped.
+    """Compress conversation history for non-agentic (plain chat) requests.
+
+    Only messages before the last user turn are compressed. Everything from
+    the last user turn onward is forwarded verbatim — not just that single
+    message — so pasted code, file contents, or any trailing messages are
+    never stripped. A client-supplied system message (e.g. a client's own
+    behavioral prompt) is preserved verbatim and combined with ShapeShifter's
+    own directive rather than being discarded.
+    """
+    client_system = next((m for m in original_messages if m.get("role") == "system"), None)
+    non_system    = [m for m in original_messages if m.get("role") != "system"]
+
     last_user_idx = next(
-        (i for i in range(len(original_messages) - 1, -1, -1)
-         if original_messages[i].get("role") == "user"),
+        (i for i in range(len(non_system) - 1, -1, -1)
+         if non_system[i].get("role") == "user"),
         None,
     )
     if last_user_idx is not None and last_user_idx > 0:
-        history   = original_messages[:last_user_idx]
-        current   = original_messages[last_user_idx]
+        history = non_system[:last_user_idx]
+        current = non_system[last_user_idx:]
     else:
-        history   = []
-        current   = original_messages[-1] if original_messages else {"role": "user", "content": ""}
+        history = []
+        current = non_system[-1:] if non_system else [{"role": "user", "content": ""}]
 
-    raw_ctx, transformed_ctx = apply_transform(mode, history) if history else ("", "")
-    contract_type  = detect_contract_type(original_messages)
-    system_content = build_system_prompt(mode, contract_type)
+    current_text = "\n\n".join(m.get("content", "") for m in current if isinstance(m.get("content"), str))
+    raw_ctx, transformed_ctx = apply_transform(mode, history, current_text) if history else ("", "")
+    # Contract type is frozen to the FIRST user turn, not re-derived from the
+    # whole (growing) history: re-scanning every turn lets a later keyword
+    # flip the OUTPUT_CONTRACT section of the system message mid-session,
+    # which would break the byte-stable prefix providers rely on for prompt
+    # caching (see Feature 4, docs/token_savings_roadmap.md). The opening
+    # ask defines the task type; later incidental keywords shouldn't.
+    first_user_msg = next((m for m in original_messages if m.get("role") == "user"), None)
+    contract_type    = detect_contract_type([first_user_msg] if first_user_msg else [])
+    shapeshifter_sys = build_system_prompt(mode, contract_type)
+    client_sys_text  = client_system.get("content", "") if client_system else ""
+    system_content = (
+        f"{client_sys_text}\n\n{shapeshifter_sys}"
+        if isinstance(client_sys_text, str) and client_sys_text.strip()
+        else shapeshifter_sys
+    )
 
     new_messages: list[dict] = [{"role": "system", "content": system_content}]
     if transformed_ctx:
         new_messages.append({"role": "user",      "content": transformed_ctx})
         new_messages.append({"role": "assistant",  "content": "Understood."})
-    new_messages.append(current)
+    new_messages.extend(current)
 
     # stats are computed over the full raw context vs compressed history
-    full_raw = apply_transform("raw", original_messages)[0] if history else current.get("content", "")
+    full_raw = (
+        apply_transform("raw", non_system)[0] if history
+        else "\n\n".join(m.get("content", "") for m in current if isinstance(m.get("content"), str))
+    )
     return new_messages, full_raw, transformed_ctx
 
 # ---------------------------------------------------------------------------
@@ -469,22 +601,9 @@ def _normalise_models(raw: dict) -> list[dict]:
     return sorted(models, key=lambda x: x["id"])
 
 
-@app.get("/v1/upstream/models")
-async def upstream_models(url: str = ""):
-    """Proxy GET /models to the requested provider (or active upstream if url omitted).
-
-    The caller passes ?url=<base_url> so Browse always fetches from the provider
-    currently selected in the dashboard, not necessarily the active one.
-    Key is looked up from _provider_keys; falls back to UPSTREAM_KEY for active URL.
-    """
+async def _fetch_provider_models(target_base: str, api_key: str) -> list[dict]:
+    """Fetch + normalise the model list for a given provider base URL."""
     import httpx  # already installed via requirements
-
-    target_base = (url.strip() or UPSTREAM_URL).rstrip("/")
-    if not target_base:
-        return JSONResponse({"error": "No provider URL specified or configured"}, status_code=503)
-
-    # resolve key: use saved key for that URL, fall back to active key if same URL
-    api_key = _provider_keys.get(target_base) or (UPSTREAM_KEY if target_base == UPSTREAM_URL.rstrip("/") else "")
 
     headers: dict = {"Content-Type": "application/json"}
     if api_key:
@@ -498,16 +617,99 @@ async def upstream_models(url: str = ""):
     else:
         fetch_url = target_base + "/models"
 
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(fetch_url, headers=headers)
+        r.raise_for_status()
+        raw = r.json()
+
+    return _normalise_models(raw)
+
+
+@app.get("/v1/upstream/models")
+async def upstream_models(url: str = ""):
+    """Proxy GET /models to the requested provider (or active upstream if url omitted).
+
+    The caller passes ?url=<base_url> so Browse always fetches from the provider
+    currently selected in the dashboard, not necessarily the active one.
+    Key is looked up from _provider_keys; falls back to UPSTREAM_KEY for active URL.
+    """
+    target_base = (url.strip() or UPSTREAM_URL).rstrip("/")
+    if not target_base:
+        return JSONResponse({"error": "No provider URL specified or configured"}, status_code=503)
+
+    # resolve key: use saved key for that URL, fall back to active key if same URL
+    api_key = _provider_keys.get(target_base) or (UPSTREAM_KEY if target_base == UPSTREAM_URL.rstrip("/") else "")
+
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(fetch_url, headers=headers)
-            r.raise_for_status()
-            raw = r.json()
+        models = await _fetch_provider_models(target_base, api_key)
     except Exception as exc:
         return JSONResponse({"error": f"Upstream error: {exc}"}, status_code=502)
 
-    models = _normalise_models(raw)
     return JSONResponse({"data": models, "count": len(models), "provider_url": target_base})
+
+
+@app.get("/v1/models")
+async def list_models():
+    """Standard OpenAI models-list endpoint. OpenAI-compatible clients (Cline,
+    Continue, etc.) call this to discover available models and their real
+    context length — without it, a client has no way to know e.g. that
+    `deepseek/deepseek-v4-flash` has a 1M-token context and silently falls
+    back to a generic default (128K is a common one), which shows up in the
+    client's own context-usage UI as an artificially small window. This has
+    nothing to do with ShapeShifter's compression — it's purely a discovery
+    gap this endpoint closes by proxying the active upstream's real model
+    list, reusing the same fetch/normalise path as the dashboard's Browse
+    feature, in the standard `{"object": "list", "data": [...]}` envelope
+    with `context_length` included as the (widely supported, if unofficial)
+    extra field clients look for.
+    """
+    target_base = UPSTREAM_URL.rstrip("/")
+    if not target_base:
+        return JSONResponse({"object": "list", "data": []})
+
+    api_key = _provider_keys.get(target_base) or UPSTREAM_KEY
+    try:
+        models = await _fetch_provider_models(target_base, api_key)
+    except Exception:
+        # Upstream unreachable — still respond in the standard shape (with
+        # just the configured default model, no metadata) rather than
+        # erroring out a client that only wanted a model list to render.
+        models = [{"id": _current_model, "context_length": None}]
+
+    data = [{
+        "id": m["id"],
+        "object": "model",
+        "created": 0,
+        "owned_by": m["id"].split("/", 1)[0] if "/" in m["id"] else "shapeshifter",
+        "context_length": m.get("context_length"),
+    } for m in models]
+    return JSONResponse({"object": "list", "data": data})
+
+
+async def _auto_resolve_model_pricing() -> None:
+    """Best-effort: look up pricing for the active model so the 'Est. $ Saved'
+    card is populated on startup without requiring a manual Browse selection."""
+    global _model_input_cost_per_1m
+    target_base = UPSTREAM_URL.rstrip("/")
+    if not target_base or not _current_model:
+        return
+    api_key = _provider_keys.get(target_base) or UPSTREAM_KEY
+    try:
+        models = await _fetch_provider_models(target_base, api_key)
+    except Exception:
+        return
+    for m in models:
+        if m["id"] == _current_model:
+            _model_input_cost_per_1m = m["input_cost_per_1m"]
+            return
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    await _auto_resolve_model_pricing()
+    yield
+
+app.router.lifespan_context = _lifespan
 
 
 @app.get("/v1/config/providers")
@@ -662,41 +864,67 @@ async def stats_stream():
     )
 
 
-def _to_sse_stream(upstream_response: dict, request_id: str) -> "AsyncGenerator[str, None]":
-    """Convert a non-streaming upstream response to OpenAI SSE format."""
-    async def _gen() -> AsyncGenerator[str, None]:
-        chunk_id = upstream_response.get("id", f"chatcmpl-{request_id}")
-        model    = upstream_response.get("model", DEFAULT_MODEL)
-        content  = ""
+_PASSTHROUGH_BODY_KEYS = ("model", "messages", "temperature", "max_tokens", "stream", "context_mode")
+
+
+def _extra_params(body: dict) -> dict:
+    """Anything in the request body ShapeShifter doesn't special-case is
+    forwarded to the upstream untouched: tools, tool_choice, top_p, stop,
+    response_format, seed, parallel_tool_calls, stream_options, etc."""
+    return {k: v for k, v in body.items() if k not in _PASSTHROUGH_BODY_KEYS}
+
+
+def _finalize_stats(mode: str, stats: dict, latency_ms: float, request_id: str,
+                     model: str, output_text: str) -> dict:
+    """Record stats/logs for a completed request (streamed or not) and return
+    the `_shapeshifter` metrics block to attach to the response."""
+    output_tokens = count_tokens(output_text)
+    if LOG_RESPONSES:
+        _log("responses.jsonl", {
+            "timestamp": datetime.utcnow().isoformat(),
+            "request_id": request_id, "mode": mode,
+            "estimated_output_tokens": output_tokens,
+            "latency_ms": round(latency_ms, 1), "status": "success",
+            "compression_ratio": stats["compression_ratio"],
+            "reduction_pct": stats["reduction_pct"],
+        })
+    _record_stats(mode, stats, latency_ms, request_id=request_id, model=model)
+    return {"request_id": request_id, "mode": mode, **stats, "latency_ms": round(latency_ms, 1)}
+
+
+async def _relay_stream(
+    agen: AsyncGenerator[dict, None], first_chunk: dict, t0: float,
+    mode: str, stats: dict, request_id: str, model: str,
+) -> AsyncGenerator[str, None]:
+    """Forward upstream SSE chunks to the client as they arrive — no
+    buffering of the full response — while accumulating output text so
+    stats can be recorded once the stream actually ends. `_shapeshifter`
+    metrics are attached to the final chunk, mirroring how they're attached
+    to the full response body in the non-streaming path."""
+    output_text_parts: list[str] = []
+
+    def _accumulate(chunk: dict) -> None:
         try:
-            content = upstream_response["choices"][0]["message"]["content"] or ""
-        except (KeyError, IndexError):
+            delta = chunk["choices"][0].get("delta", {})
+            if delta.get("content"):
+                output_text_parts.append(delta["content"])
+        except (KeyError, IndexError, TypeError):
             pass
 
-        # role delta
-        role_chunk = {
-            "id": chunk_id, "object": "chat.completion.chunk", "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        }
-        yield f"data: {json.dumps(role_chunk)}\n\n"
-
-        # content delta (single chunk — simpler, Cline handles it fine)
-        if content:
-            content_chunk = {
-                "id": chunk_id, "object": "chat.completion.chunk", "model": model,
-                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(content_chunk)}\n\n"
-
-        # finish chunk
-        finish_chunk = {
-            "id": chunk_id, "object": "chat.completion.chunk", "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }
-        yield f"data: {json.dumps(finish_chunk)}\n\n"
+    pending = first_chunk
+    _accumulate(pending)
+    try:
+        async for chunk in agen:
+            yield f"data: {json.dumps(pending)}\n\n"
+            pending = chunk
+            _accumulate(pending)
+    finally:
+        latency_ms = (time.monotonic() - t0) * 1000
+        pending["_shapeshifter"] = _finalize_stats(
+            mode, stats, latency_ms, request_id, model, "".join(output_text_parts),
+        )
+        yield f"data: {json.dumps(pending)}\n\n"
         yield "data: [DONE]\n\n"
-
-    return _gen()
 
 
 @app.post("/v1/chat/completions")
@@ -718,14 +946,23 @@ async def chat_completions(request: Request):
     temp         = float(body.get("temperature", 0.2))
     max_tok      = int(body.get("max_tokens", MAX_OUTPUT_TOKENS))
     stream_req   = bool(body.get("stream", False))
+    extra        = _extra_params(body)
 
-    # Detect agentic tool-call workflows (Cline writing files, running commands…).
-    # These messages have list content with tool_use / tool_result blocks.
-    # Compressing them destroys the tool call chain — force raw passthrough.
-    agentic = _is_agentic(raw_messages)
+    # Detect agentic tool-call workflows (Cline writing files, running commands…):
+    # OpenAI-style tool_calls/tool-role messages or a declared `tools` schema,
+    # or Anthropic-style tool_use/tool_result content blocks. Compressing these
+    # destroys the tool call chain and drops the client's own system prompt —
+    # force raw passthrough of the original message structure instead.
+    agentic = _is_agentic(raw_messages, body)
     if agentic:
-        messages = raw_messages          # keep original structure intact
-        mode     = "raw"                 # bypass all compression
+        # Structure/roles are kept byte for byte — only an earlier tool-read
+        # of a file that gets read again later in this same request may be
+        # deduplicated, since only the last read is needed to act on it now
+        # (see _dedupe_repeated_tool_file_reads).
+        new_messages = _dedupe_repeated_tool_file_reads(raw_messages)
+        mode = "raw"
+        raw_ctx        = "\n\n".join(_content_as_str(m) for m in raw_messages)
+        transformed_ctx = "\n\n".join(_content_as_str(m) for m in new_messages)
     else:
         # Normalize multimodal text-only list content to plain strings.
         messages = [
@@ -734,24 +971,22 @@ async def chat_completions(request: Request):
             for m in raw_messages
         ]
         mode = _resolve_mode(body, headers)
-
-    if mode not in VALID_MODES:
-        return JSONResponse(
-            {"error": {
-                "message": f"Unknown context mode: {mode!r}",
-                "type": "invalid_request_error",
-                "code": "invalid_context_mode",
-            }},
-            status_code=400,
-        )
-
-    try:
-        new_messages, raw_ctx, transformed_ctx = _build_compressed_messages(messages, mode)
-    except Exception as exc:
-        return JSONResponse(
-            {"error": {"message": str(exc), "type": "transformation_error"}},
-            status_code=500,
-        )
+        if mode not in VALID_MODES:
+            return JSONResponse(
+                {"error": {
+                    "message": f"Unknown context mode: {mode!r}",
+                    "type": "invalid_request_error",
+                    "code": "invalid_context_mode",
+                }},
+                status_code=400,
+            )
+        try:
+            new_messages, raw_ctx, transformed_ctx = _build_compressed_messages(messages, mode)
+        except Exception as exc:
+            return JSONResponse(
+                {"error": {"message": str(exc), "type": "transformation_error"}},
+                status_code=500,
+            )
 
     stats = compression_stats(raw_ctx, transformed_ctx)
 
@@ -774,11 +1009,33 @@ async def chat_completions(request: Request):
             status_code=500,
         )
 
-    latency_ms = 0.0
+    if stream_req:
+        t0 = time.monotonic()
+        agen = stream_upstream(
+            base_url=UPSTREAM_URL, api_key=UPSTREAM_KEY, model=model,
+            messages=new_messages, temperature=temp, max_tokens=max_tok, extra_params=extra,
+        )
+        try:
+            first_chunk = await agen.__anext__()
+        except StopAsyncIteration:
+            async def _empty() -> AsyncGenerator[str, None]:
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(_empty(), media_type="text/event-stream")
+        except Exception as exc:
+            return JSONResponse(
+                {"error": {"message": f"Upstream error: {exc}", "type": "upstream_error"}},
+                status_code=502,
+            )
+        return StreamingResponse(
+            _relay_stream(agen, first_chunk, t0, mode, stats, request_id, model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     try:
         upstream_response, latency_ms = await call_upstream(
             base_url=UPSTREAM_URL, api_key=UPSTREAM_KEY, model=model,
-            messages=new_messages, temperature=temp, max_tokens=max_tok,
+            messages=new_messages, temperature=temp, max_tokens=max_tok, extra_params=extra,
         )
     except Exception as exc:
         return JSONResponse(
@@ -788,34 +1045,11 @@ async def chat_completions(request: Request):
 
     output_text = ""
     try:
-        output_text = upstream_response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
+        output_text = upstream_response["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
         pass
-    output_tokens = count_tokens(output_text)
 
-    if LOG_RESPONSES:
-        _log("responses.jsonl", {
-            "timestamp": datetime.utcnow().isoformat(),
-            "request_id": request_id, "mode": mode,
-            "estimated_output_tokens": output_tokens,
-            "latency_ms": round(latency_ms, 1), "status": "success",
-            "compression_ratio": stats["compression_ratio"],
-            "reduction_pct": stats["reduction_pct"],
-        })
-
-    _record_stats(mode, stats, latency_ms, request_id=request_id, model=model)
-
-    upstream_response["_shapeshifter"] = {
-        "request_id": request_id, "mode": mode,
-        **stats, "latency_ms": round(latency_ms, 1),
-    }
-
-    if stream_req:
-        return StreamingResponse(
-            _to_sse_stream(upstream_response, request_id),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+    upstream_response["_shapeshifter"] = _finalize_stats(mode, stats, latency_ms, request_id, model, output_text)
     return JSONResponse(upstream_response)
 
 # ---------------------------------------------------------------------------
@@ -926,9 +1160,11 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
        gap:10px;margin-bottom:20px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card.featured{border-color:var(--green);background:rgba(34,197,94,.06)}
 .card-label{color:var(--muted);font-size:9px;text-transform:uppercase;
             letter-spacing:1px;margin-bottom:6px}
 .card-value{font-size:26px;font-weight:bold}
+.card.featured .card-value{font-size:32px}
 .card-sub{color:var(--muted);font-size:9px;margin-top:3px}
 .green{color:var(--green)}.yellow{color:var(--yellow)}.accent{color:var(--accent)}
 
@@ -1004,6 +1240,16 @@ tr:hover td{background:rgba(124,106,247,.05)}
 #modal-body{overflow-y:auto;padding:14px 16px}
 #modal-ctx{white-space:pre-wrap;font-size:10px;line-height:1.6;color:var(--text);
            background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}
+
+/* ── Onboarding modal (first-run API key) ── */
+#onboarding-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);
+                    z-index:300;align-items:center;justify-content:center}
+#onboarding-overlay.open{display:flex}
+#onboarding-modal{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+                  width:min(400px,92vw);padding:20px}
+#onboarding-modal h3{font-size:13px;color:var(--accent);margin-bottom:4px}
+#onboarding-modal p{font-size:10px;color:var(--muted);margin-bottom:16px;line-height:1.5}
+#onboarding-err{font-size:9px;color:var(--red);min-height:12px;margin-top:2px}
 
 @media(max-width:600px){
   .cards{grid-template-columns:1fr 1fr}
@@ -1123,10 +1369,10 @@ tr:hover td{background:rgba(124,106,247,.05)}
 <div id="main">
 
   <div class="cards">
-    <div class="card">
-      <div class="card-label">Requests</div>
-      <div class="card-value accent" id="c-reqs">0</div>
-      <div class="card-sub">total this session</div>
+    <div class="card featured">
+      <div class="card-label">Est. $ Saved</div>
+      <div class="card-value green" id="c-dollars">&#8212;</div>
+      <div class="card-sub" id="c-dollars-sub">select model in Browse for pricing</div>
     </div>
     <div class="card">
       <div class="card-label">Tokens Saved</div>
@@ -1134,24 +1380,24 @@ tr:hover td{background:rgba(124,106,247,.05)}
       <div class="card-sub">input tokens not sent</div>
     </div>
     <div class="card">
-      <div class="card-label">Avg Compression</div>
-      <div class="card-value yellow" id="c-ratio">&#8212;</div>
-      <div class="card-sub">ratio vs raw</div>
-    </div>
-    <div class="card">
       <div class="card-label">Avg Reduction</div>
       <div class="card-value green" id="c-reduc">&#8212;</div>
       <div class="card-sub">token reduction %</div>
     </div>
     <div class="card">
+      <div class="card-label">Requests</div>
+      <div class="card-value accent" id="c-reqs">0</div>
+      <div class="card-sub">total this session</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Avg Compression</div>
+      <div class="card-value yellow" id="c-ratio">&#8212;</div>
+      <div class="card-sub">ratio vs raw</div>
+    </div>
+    <div class="card">
       <div class="card-label">Uptime</div>
       <div class="card-value accent" id="c-uptime">0s</div>
       <div class="card-sub">server running</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Est. $ Saved</div>
-      <div class="card-value green" id="c-dollars">&#8212;</div>
-      <div class="card-sub" id="c-dollars-sub">select model in Browse for pricing</div>
     </div>
   </div>
 
@@ -1223,6 +1469,24 @@ tr:hover td{background:rgba(124,106,247,.05)}
   </div>
 </div>
 
+<!-- First-run onboarding modal: blocks the dashboard until a key is set for the active provider -->
+<div id="onboarding-overlay">
+  <div id="onboarding-modal">
+    <h3>Configure a provider</h3>
+    <p>Select a provider and enter its API key to start using ShapeShifter.</p>
+    <div class="sf">
+      <label>Provider</label>
+      <select id="ob-provider" onchange="onObProviderChange()"></select>
+    </div>
+    <div class="sf" id="ob-key-row">
+      <label>API Key</label>
+      <input id="ob-key" type="password" placeholder="sk-…" onkeydown="if(event.key==='Enter')saveOnboarding()">
+    </div>
+    <div id="onboarding-err"></div>
+    <button class="btn" style="width:100%;margin-top:6px" onclick="saveOnboarding()">Save &amp; Continue</button>
+  </div>
+</div>
+
 <script>
 const PORT = location.port || '8787';
 
@@ -1284,7 +1548,10 @@ async function keyActionClick() {
   }
 }
 
+let _lastKeyStatus = null;
+
 function setKeyBadge(status, maskedKey) {
+  _lastKeyStatus = status;
   const badge = document.getElementById('key-badge');
   const hint  = document.getElementById('key-hint');
   const inp   = document.getElementById('s-key');
@@ -1381,6 +1648,69 @@ async function loadSettings() {
   await loadProviders();
   // badge reflects the KEY STATUS of the currently selected URL, not _config's key
   await refreshKeyBadge();
+  maybeShowOnboarding();
+}
+
+// ── First-run onboarding (blocks dashboard until a key is set) ────
+function maybeShowOnboarding() {
+  const overlay = document.getElementById('onboarding-overlay');
+  if (_lastKeyStatus === 'not_set') {
+    populateOnboarding();
+    overlay.classList.add('open');
+  } else {
+    overlay.classList.remove('open');
+  }
+}
+
+function populateOnboarding() {
+  const sel = document.getElementById('ob-provider');
+  sel.innerHTML = '';
+  _providers.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.url;
+    const icon = p.key_status === 'saved' ? ' ✓' : p.key_status === 'not_required' ? '' : ' ⚠';
+    opt.textContent = p.name + icon;
+    sel.appendChild(opt);
+  });
+  const current = currentSelectedUrl();
+  if (current && Array.from(sel.options).some(o => o.value === current)) sel.value = current;
+  onObProviderChange();
+}
+
+function onObProviderChange() {
+  const sel = document.getElementById('ob-provider');
+  const p = _providers.find(x => x.url === sel.value);
+  document.getElementById('ob-key-row').style.display = (p && p.key_status === 'not_required') ? 'none' : '';
+  document.getElementById('ob-key').value = '';
+  document.getElementById('onboarding-err').textContent = '';
+}
+
+async function saveOnboarding() {
+  const sel = document.getElementById('ob-provider');
+  const url = sel.value;
+  const err = document.getElementById('onboarding-err');
+  if (!url) { err.textContent = 'Select a provider.'; return; }
+  const p = _providers.find(x => x.url === url);
+  const needsKey = !p || p.key_status !== 'not_required';
+  const key = document.getElementById('ob-key').value.trim();
+  if (needsKey && !key) { err.textContent = 'API key required for this provider.'; return; }
+  err.textContent = '';
+  try {
+    if (needsKey) {
+      const r = await fetch('/v1/config/provider-key', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url, key})
+      });
+      const d = await r.json();
+      if (d.status !== 'saved') { err.textContent = 'Failed to save key.'; return; }
+    }
+    // switch the active provider to the one chosen here
+    await fetch('/v1/config/settings', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({upstream_base_url: url})
+    });
+    await loadSettings();
+  } catch(e) { err.textContent = 'Network error.'; }
 }
 
 async function saveSettings() {

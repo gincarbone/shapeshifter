@@ -125,6 +125,326 @@ def _extract_user_requirements(context: str) -> list[str]:
     return [b.strip() for b in blocks if b.strip()]
 
 
+_FENCE_LANG = re.compile(r'```(\w+)?')
+_FILENAME_COMMENT = re.compile(
+    r'(?:^|\n)\s*(?:#|//|/\*|<!--)\s*(?:file(?:name)?:?\s*)?'
+    r'([\w\-./\\]+\.\w{1,10})\b',
+    re.IGNORECASE,
+)
+_FILENAME_HEADER = re.compile(
+    r'(?:\*\*|##+|`)\s*([\w\-./\\]+\.\w{1,10})\s*(?:\*\*|`)?\s*\n?\s*$',
+)
+
+
+def _artifact_key(code_block: str, preceding_text: str) -> str:
+    """Best-effort identifier for the file/artifact a code block represents,
+    so later versions of the SAME file can supersede earlier ones instead of
+    being treated as unrelated blocks.
+
+    Tries, in order: a filename comment inside the block, a filename mentioned
+    in the assistant text right before the block (e.g. "**app.py**" or
+    "`app.py`:"), then falls back to the fence language — which correctly
+    collapses the common single-file iterative-build session (one Python or
+    HTML file revised turn after turn) into one artifact even with no
+    filename ever mentioned.
+    """
+    m = _FILENAME_COMMENT.search(code_block[:200])
+    if m:
+        return m.group(1).lower()
+    m = _FILENAME_HEADER.search(preceding_text[-200:])
+    if m:
+        return m.group(1).lower()
+    m = _FENCE_LANG.match(code_block)
+    lang = (m.group(1) or "code").lower() if m else "code"
+    return f"__lang__:{lang}"
+
+
+def _extract_latest_artifacts(context: str) -> dict[str, str]:
+    """Walk [USER] and [ASSISTANT] blocks in chronological order and keep only
+    the LAST code block seen per artifact key, regardless of which role
+    produced it. Earlier versions of the same file are superseded and
+    dropped — but unlike dropping all generated code, the model still gets
+    the actual current state of every file it has touched, which is required
+    to make a precise edit or fix a bug instead of regenerating from scratch.
+
+    A user pasting the current state of a file they edited by hand (or an
+    error dump with the file attached) supersedes an earlier assistant draft
+    just as much as a newer assistant turn would — what matters is which
+    version is chronologically last, not which role wrote it.
+    """
+    blocks = re.findall(
+        r'\[(?:USER|ASSISTANT)\]\n([\s\S]*?)(?=\n\n\[(?:USER|ASSISTANT)\]|$)',
+        context,
+    )
+    latest: dict[str, str] = {}
+    for block in blocks:
+        for code in _extract_code_blocks(block):
+            idx = block.find(code)
+            preceding = block[:idx] if idx >= 0 else ""
+            key = _artifact_key(code, preceding)
+            latest[key] = code  # overwritten on re-occurrence — last write wins
+    return latest
+
+
+def _extract_artifact_versions(context: str) -> dict[str, list[str]]:
+    """Like `_extract_latest_artifacts`, but keeps the last TWO versions per
+    key (previous, current) instead of only the latest — needed to know
+    which top-level blocks are unchanged between them (see
+    `_collapse_unchanged_blocks`). Returns `[current]` for a key seen only
+    once (nothing to diff against yet).
+    """
+    blocks = re.findall(
+        r'\[(?:USER|ASSISTANT)\]\n([\s\S]*?)(?=\n\n\[(?:USER|ASSISTANT)\]|$)',
+        context,
+    )
+    versions: dict[str, list[str]] = {}
+    for block in blocks:
+        for code in _extract_code_blocks(block):
+            idx = block.find(code)
+            preceding = block[:idx] if idx >= 0 else ""
+            key = _artifact_key(code, preceding)
+            history = versions.setdefault(key, [])
+            history.append(code)
+            if len(history) > 2:
+                history.pop(0)
+    return versions
+
+
+_DEF_LINE = re.compile(
+    r'^\s*(?:async\s+|export\s+|default\s+|pub\s+)*(?:'
+    r'def\s+\w+|function\s+\w+|fn\s+\w+|fun\s+\w+|func\s+\w+|sub\s+\w+|proc\s+\w+'
+    r'|class\s+\w+|struct\s+\w+|interface\s+\w+|enum\s+\w+|impl\s+\w+|trait\s+\w+'
+    r')',
+    re.IGNORECASE,
+)
+_DECORATOR_LINE = re.compile(r'^\s*@\w')
+
+
+def _split_definition_blocks(code: str) -> list[tuple[str | None, str]]:
+    """Split code into (header, full_block_text) chunks at EVERY function/
+    method/type declaration line, regardless of indentation — this is what
+    gives per-method granularity inside a class instead of treating the
+    whole class as one indivisible block. Reuses the same multi-language
+    keyword set as `_CODE_SIGNALS` (Python `def`, JS/TS `function`, Rust
+    `fn`, Go `func`, Kotlin/Swift `fun`, plus `class`/`struct`/`interface`/
+    `enum`/`impl`/`trait`) rather than a single language's syntax, so this
+    isn't Python-only — plus common modifiers that precede a declaration
+    (`async`, JS/TS `export`/`export default`, Rust `pub`) so `async def`,
+    `export function`, `pub fn`, etc. are still recognized as the
+    declaration they modify. Decorators/annotations (`@Something` — Python
+    decorators and Java/C#-style annotations share the same syntax) directly
+    above a declaration are kept attached to that block, not left dangling
+    in the previous one. `header` is `None` for the shared preamble before
+    the first declaration.
+
+    This deliberately doesn't do real brace-matching or indentation-depth
+    tracking — a block is just "everything from this declaration line up to
+    the next one." That's exactly right for flat, sequential declarations
+    (the overwhelming common case for generated code) but under-splits a
+    declaration nested inside another one (e.g. a helper function defined
+    inside a method): the outer declaration's block gets cut short at the
+    inner one's start, and the inner block absorbs the outer's remaining
+    body. This doesn't create a correctness risk — `_collapse_unchanged_blocks`
+    still only collapses on exact text equality of whatever range was
+    captured — but the block LABEL in that case describes less than what it
+    actually contains. A class's own header line (e.g. `class Foo:`) becomes
+    its own near-empty block since the very next line already starts the
+    first method's block — harmless, and deliberately never collapsed (see
+    `_collapse_unchanged_blocks`'s header-only guard) since there's nothing
+    worth collapsing in a single line.
+
+    Returns `[]` if no declaration line is recognized at all — callers must
+    treat that as "can't confidently identify blocks here" and keep the
+    whole file in full rather than guessing at boundaries in an unrecognized
+    language or style (e.g. JS arrow functions, Bash `foo() { }`).
+    """
+    lines = code.splitlines(keepends=True)
+    def_starts = [i for i, ln in enumerate(lines) if _DEF_LINE.match(ln)]
+    if not def_starts:
+        return []
+
+    starts: list[int] = []
+    for i in def_starts:
+        s = i
+        while s > 0 and _DECORATOR_LINE.match(lines[s - 1]):
+            s -= 1
+        starts.append(s)
+    starts = sorted(set(starts))
+
+    blocks: list[tuple[str | None, str]] = []
+    if starts[0] > 0:
+        blocks.append((None, "".join(lines[:starts[0]])))
+    for i, start in enumerate(starts):
+        if i + 1 < len(starts):
+            end = starts[i + 1]
+            header_idx = next(j for j in range(start, end) if _DEF_LINE.match(lines[j]))
+        else:
+            # Last declaration: bound its body by indentation instead of
+            # running to end-of-file, so trailing top-level code (a
+            # `if __name__ == "__main__":` block, module-level calls) isn't
+            # silently absorbed into it — see Feature 5 in
+            # docs/token_savings_roadmap.md. Measure indentation from the
+            # actual declaration line, not `start` — `start` may point at a
+            # decorator line backed up to keep it attached to this block.
+            header_idx = next(j for j in range(start, len(lines)) if _DEF_LINE.match(lines[j]))
+            header_indent = len(lines[header_idx]) - len(lines[header_idx].lstrip(" \t"))
+            end = _find_block_end_by_indent(lines, header_idx, header_indent)
+        block_text = "".join(lines[start:end])
+        header = lines[header_idx].rstrip("\n")
+        blocks.append((header, block_text))
+        if i + 1 == len(starts) and end < len(lines):
+            blocks.append((None, "".join(lines[end:])))
+    return blocks
+
+
+_LONE_CLOSER = re.compile(r'^[)\]}]+[;,]?$')
+
+
+def _find_block_end_by_indent(lines: list[str], start: int, header_indent: int) -> int:
+    """Scan forward from a declaration's header line for the first non-blank
+    line whose indentation is <= the header's own — the boundary between
+    "this declaration's own body" and whatever top-level code follows it at
+    the same or shallower level. Works for both indentation-delimited
+    (Python) and brace-delimited code, since well-formatted generated code
+    de-indents when a block ends regardless of language.
+
+    A lone closing brace/bracket/paren (`}`, `);`, etc.) at that same
+    indentation is the block's OWN closing delimiter in brace languages, not
+    a boundary — it's included in the block and scanning continues past it.
+    Returns `len(lines)` if no real boundary is found (the declaration runs
+    to the end of the file).
+    """
+    j = start + 1
+    while j < len(lines):
+        line = lines[j]
+        if not line.strip():
+            j += 1
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if indent <= header_indent:
+            if _LONE_CLOSER.match(line.strip()):
+                j += 1
+                continue
+            return j
+        j += 1
+    return len(lines)
+
+
+def _collapse_unchanged_blocks(prev: str, current: str) -> str:
+    """Collapse function/method/type blocks in `current` that are EXACTLY
+    byte-identical to a same-named block in `prev` down to a signature-only
+    stub; every block that changed, is new, or can't be matched by name
+    stays in full. The collapse condition is exact string equality — not
+    proximity to a diff — so there is no risk of discarding part of a block
+    that actually changed.
+
+    Falls back to returning `current` completely unchanged whenever block
+    splitting isn't confident: no recognized declaration keyword found (see
+    `_DEF_LINE` — covers Python/JS/TS/Go/Rust/Kotlin-ish syntax and
+    class/struct/interface/enum/impl/trait, but not e.g. JS arrow functions
+    or Bash-style `foo() { }`), or fewer than 2 blocks total (nothing
+    meaningful to collapse).
+    """
+    curr_blocks = _split_definition_blocks(current)
+    if len(curr_blocks) < 2:
+        return current
+
+    prev_by_header = {h: b for h, b in _split_definition_blocks(prev) if h is not None}
+
+    out = []
+    for header, block_text in curr_blocks:
+        if header is None:
+            out.append(block_text)  # preamble (imports, module docstring) always kept in full
+            continue
+        # A block that's just its own header line (e.g. a bare "class Foo:"
+        # whose methods are split out as separate blocks right after it) has
+        # nothing worth collapsing — skip it rather than emit a redundant stub.
+        header_only = block_text.count("\n") <= 1
+        if not header_only and header in prev_by_header and prev_by_header[header] == block_text:
+            base_indent = len(header) - len(header.lstrip(" "))
+            stub_indent = " " * (base_indent + 4)
+            out.append(f"{header}\n{stub_indent}...  # unchanged since previous version\n")
+        else:
+            out.append(block_text)
+    return "".join(out)
+
+
+def _extract_latest_artifacts_collapsed(context: str) -> dict[str, str]:
+    """Like `_extract_latest_artifacts`, but for artifacts where a previous
+    version exists and both versions are confidently splittable into
+    function/method/type-level blocks (see `_split_definition_blocks` for
+    which languages/keywords are recognized), unchanged blocks collapse to a
+    signature-only stub — only the regions that actually changed (or are
+    new) stay in full. Falls back to the untouched latest version whenever
+    that confidence isn't there, so this never discards content it can't
+    prove is unchanged.
+    """
+    versions = _extract_artifact_versions(context)
+    result: dict[str, str] = {}
+    for key, history in versions.items():
+        if len(history) == 2:
+            result[key] = _collapse_unchanged_blocks(history[0], history[1])
+        else:
+            result[key] = history[-1]
+    return result
+
+
+_TOPLEVEL_IDENT = re.compile(
+    r'^\s*(?:class|def|function|fn|func|struct|interface|enum)\s+(\w+)',
+    re.MULTILINE,
+)
+
+
+def _artifact_identifiers(code: str) -> list[str]:
+    """Top-level class/function/type names declared in a code block — used to
+    catch references like "the User model" that name an identifier the file
+    defines without ever spelling out the filename itself."""
+    return _TOPLEVEL_IDENT.findall(code)
+
+
+def _format_artifacts_block(artifacts: dict[str, str], current_text: str = "") -> list[str]:
+    """Render retained artifacts, collapsing ones that don't look relevant to
+    the CURRENT turn to a one-line stub instead of their full body.
+
+    An artifact stays fully expanded if: its filename OR any class/function
+    it declares is mentioned in the current turn's message (catches "the
+    User model" as well as "models.py"), it's the only artifact being
+    tracked (nothing to gain by collapsing), or it has no resolvable
+    filename at all (a fence-language fallback key — there's no name the
+    model could use to ask for it again, so collapsing it would make it
+    unrecoverable rather than just deferred). When in doubt this heuristic
+    is deliberately biased toward NOT collapsing — the retention mechanism
+    exists specifically so an edit turn can see the file it's editing,
+    and a false "irrelevant" guess is a much worse failure than a missed
+    compression opportunity. Collapsed entries always say so explicitly and
+    invite the model to ask again, rather than silently going quiet about a
+    file it already knows exists.
+    """
+    if not artifacts:
+        return []
+    lines = ["", "current_artifacts (latest version of each file touched so far — "
+                  "edit these directly for fixes/changes, do not regenerate from scratch; "
+                  "collapsed entries are unchanged, ask to see one again if you need its content):"]
+    only_one = len(artifacts) == 1
+    current_lower = current_text.lower()
+    for key, code in artifacts.items():
+        named = not key.startswith("__lang__:")
+        label = key if named else f"(unnamed {key.split(':', 1)[1]} file)"
+        mentioned = key.lower() in current_lower or any(
+            ident.lower() in current_lower for ident in _artifact_identifiers(code)
+        )
+        active = only_one or not named or mentioned
+        stub = f"  --- {label}: {code.count(chr(10)) + 1} lines, unchanged since last shown — ask to see it again if needed ---"
+        # Never collapse if the stub itself wouldn't actually be smaller —
+        # for a short file the fixed cost of the stub text can outweigh what
+        # it replaces (same principle as the tool-read dedup size guard).
+        if active or len(stub) >= len(code):
+            lines += [f"  --- {label} ---", code]
+        else:
+            lines.append(stub)
+    return lines
+
+
 def _infer_stack(text: str) -> list[str]:
     stacks = {
         "Python": r'\bpython\b|\.py\b|traceback|pip\b',
@@ -148,11 +468,11 @@ def _infer_stack(text: str) -> list[str]:
 # Transformers
 # ---------------------------------------------------------------------------
 
-def transform_raw(context: str) -> str:
+def transform_raw(context: str, current_text: str = "") -> str:
     return context
 
 
-def transform_minimal(context: str) -> str:
+def transform_minimal(context: str, current_text: str = "") -> str:
     error_lines = _extract_error_lines(context)
     files = _extract_filenames(context)
 
@@ -173,17 +493,23 @@ def transform_minimal(context: str) -> str:
     return "\n".join(parts)
 
 
-def transform_yaml(context: str) -> str:
-    # For multi-turn coding sessions: requirements list only, no task/stack inference
-    # (task inference also scans workspace context and produces false positives).
+def transform_yaml(context: str, current_text: str = "") -> str:
+    # For multi-turn coding sessions: requirements list + latest artifact
+    # version only, no task/stack inference (task inference also scans
+    # workspace context and produces false positives).
     if _is_coding_session(context):
         reqs = _extract_user_requirements(context)
+        artifacts = _extract_latest_artifacts_collapsed(context)
         data: dict = {
             "context_mode": "yaml",
             "cumulative_requirements": reqs,
             "constraint": "Return COMPLETE file. All requirements must be present.",
         }
-        return "context_mode: yaml\n\n" + yaml.dump(data, default_flow_style=False, allow_unicode=True).strip()
+        out = "context_mode: yaml\n\n" + yaml.dump(data, default_flow_style=False, allow_unicode=True).strip()
+        # Appended as plain text rather than YAML scalars — code blocks contain
+        # quotes/colons/backticks that make forced YAML escaping unreadable.
+        out += "\n".join(_format_artifacts_block(artifacts, current_text))
+        return out
 
     task = _infer_task(context)
     stack = _infer_stack(context)
@@ -208,7 +534,7 @@ def transform_yaml(context: str) -> str:
     return "\n".join(lines)
 
 
-def transform_json(context: str) -> str:
+def transform_json(context: str, current_text: str = "") -> str:
     task = _infer_task(context)
     stack = _infer_stack(context)
     errors = [ln.strip() for ln in _extract_error_lines(context, 5)]
@@ -229,7 +555,7 @@ def transform_json(context: str) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def transform_table(context: str) -> str:
+def transform_table(context: str, current_text: str = "") -> str:
     task = _infer_task(context)
     stack = _infer_stack(context)
     errors = _extract_error_lines(context, 3)
@@ -247,13 +573,14 @@ def transform_table(context: str) -> str:
     return header + "\n" + body
 
 
-def transform_hybrid(context: str) -> str:
+def transform_hybrid(context: str, current_text: str = "") -> str:
     # For multi-turn coding sessions: requirements only, no stack inference.
     # Stack detection scans the whole context including workspace files sent by
     # the client, which causes false positives (e.g. ShapeShifter's own Python
     # source appears in context when the user asks to create a JSP).
     if _is_coding_session(context):
         reqs = _extract_user_requirements(context)
+        artifacts = _extract_latest_artifacts_collapsed(context)
         parts = [
             "context_mode: hybrid",
             "",
@@ -264,6 +591,7 @@ def transform_hybrid(context: str) -> str:
         ]
         for i, r in enumerate(reqs, 1):
             parts.append(f"  [{i}]: {r}")
+        parts += _format_artifacts_block(artifacts, current_text)
         return "\n".join(parts)
 
     task = _infer_task(context)
@@ -314,7 +642,7 @@ def transform_hybrid(context: str) -> str:
     return "\n".join(parts)
 
 
-def transform_symbolic(context: str) -> str:
+def transform_symbolic(context: str, current_text: str = "") -> str:
     task = _infer_task(context)
     stack = _infer_stack(context)
     errors = _extract_error_lines(context, 3)
@@ -337,12 +665,14 @@ def transform_symbolic(context: str) -> str:
     return "\n".join(lines)
 
 
-def transform_incremental(context: str) -> str:
+def transform_incremental(context: str, current_text: str = "") -> str:
     """For multi-turn coding/generation sessions.
 
     Keeps all USER requirements across turns (the feature list the model must
-    honour) and discards ASSISTANT responses (the code). The model can regenerate
-    code from requirements but cannot recover requirements that were lost.
+    honour) plus the latest version of each generated artifact — only
+    superseded versions of a file are discarded, not every ASSISTANT response.
+    The model can then edit the current file directly instead of having to
+    regenerate it blind from requirements alone.
     """
     # Parse [USER] / [ASSISTANT] blocks produced by apply_transform
     blocks = re.findall(
@@ -361,6 +691,8 @@ def transform_incremental(context: str) -> str:
         # Fallback: treat full context as single requirement
         return f"REQUIREMENT:\n{context[:600]}\n\nReturn complete working code."
 
+    artifacts = _extract_latest_artifacts_collapsed(context)
+
     lines = [
         "CODING_SESSION: incremental",
         "RULE: Every requirement listed below MUST be present in the final output.",
@@ -370,6 +702,7 @@ def transform_incremental(context: str) -> str:
     for i, req in enumerate(user_reqs, 1):
         lines.append(f"\n[{i}] {req}")
 
+    lines += _format_artifacts_block(artifacts, current_text)
     lines += [
         "",
         "CONSTRAINT: Return the COMPLETE updated file. No truncation. No placeholders.",
@@ -377,7 +710,7 @@ def transform_incremental(context: str) -> str:
     return "\n".join(lines)
 
 
-def transform_matrix(context: str) -> str:
+def transform_matrix(context: str, current_text: str = "") -> str:
     task = _infer_task(context)
     stack = _infer_stack(context)
     errors = _extract_error_lines(context, 4)
@@ -413,7 +746,7 @@ def transform_matrix(context: str) -> str:
 # Registry
 # ---------------------------------------------------------------------------
 
-TRANSFORMERS: dict[str, Callable[[str], str]] = {
+TRANSFORMERS: dict[str, Callable[[str, str], str]] = {
     "raw":         transform_raw,
     "minimal":     transform_minimal,
     "yaml":        transform_yaml,
@@ -428,8 +761,14 @@ TRANSFORMERS: dict[str, Callable[[str], str]] = {
 VALID_MODES = set(TRANSFORMERS.keys())
 
 
-def apply_transform(mode: str, messages: list[dict]) -> tuple[str, str]:
-    """Return (original_context, transformed_context)."""
+def apply_transform(mode: str, messages: list[dict], current_text: str = "") -> tuple[str, str]:
+    """Return (original_context, transformed_context).
+
+    `current_text` is the CURRENT turn's user message (not part of
+    `messages`/history) — coding-session modes use it to decide which
+    retained artifacts are relevant to this turn (see `_format_artifacts_block`).
+    Modes that don't need it simply ignore the argument.
+    """
     if mode not in VALID_MODES:
         raise ValueError(f"Unknown context mode: {mode!r}. Valid: {sorted(VALID_MODES)}")
 
@@ -438,5 +777,5 @@ def apply_transform(mode: str, messages: list[dict]) -> tuple[str, str]:
         for m in messages
         if isinstance(m.get("content"), str)
     )
-    transformed = TRANSFORMERS[mode](raw)
+    transformed = TRANSFORMERS[mode](raw, current_text)
     return raw, transformed
