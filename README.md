@@ -11,7 +11,7 @@ In a multi-turn coding session, most of your context window is old generated cod
 **In the benchmarks below, all three coding modes score 10/10 on the same automated checks as uncompressed `raw` — while sending 4–18% of the tokens.**
 
 ```
-Your client  →  ShapeShifter :8787  →  OpenRouter / DeepSeek / OpenAI / Ollama / …
+Your client  →  ShapeShifter (http://127.0.0.1:8787)  →  OpenRouter / DeepSeek / OpenAI / Ollama / …
                (compresses history)       (receives only what matters)
 ```
 
