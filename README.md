@@ -69,7 +69,7 @@ Key properties:
 **Requirements:** Python 3.10+
 
 ```bash
-git clone https://github.com/your-username/shapeshifter.git
+git clone https://github.com/gincarbone/shapeshifter.git
 cd shapeshifter
 ```
 
