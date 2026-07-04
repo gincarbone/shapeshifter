@@ -1,15 +1,14 @@
 # ShapeShifter
 
-**A local OpenAI-compatible proxy that compresses conversation history before sending it to any LLM provider — cutting input tokens by up to 97% while preserving output quality.**
+**A drop-in OpenAI proxy that cuts coding-agent input tokens by 80–95% — by throwing away the code the model already wrote.**
 
+In a multi-turn coding session, most of your context window is old generated code the model doesn't actually need again: it re-derives whatever it references. ShapeShifter sits between your client (Cline, Continue, Aider, Open WebUI, curl, your own code) and any OpenAI-compatible API. It strips that regenerable code out of the history, keeps every one of your instructions **verbatim**, and forwards a payload that's a fraction of the size. Standard API in, standard API out — nothing changes on either end.
 
-Human language is powerful, but it's not efficient in an LLM context. This context continues to grow, as do scenarios involving coding agents and agent swarms.
+![ShapeShifter live dashboard — tokens before/after on a real coding session](docs/demo.gif)
 
-ShapeShifter reshapes the context to make it more efficient, smaller, concentrated, and distilled.
+> **How is this different from LLMLingua?** LLMLingua drops low-value *tokens* using an ML model — lossy and opaque. ShapeShifter is structural and predictable: it removes whole *assistant-generated code blocks* from history and never touches your messages. No extra model, no lossy token soup, no config.
 
-It is a structural reformulation of the context using more efficient archetypes and methodologies, eliminating duplications, cleaning up redundant information.
-
-ShapeShifter sits between your AI client (Cline, Continue, Open WebUI, curl, your own code) and any OpenAI-compatible upstream API. It restructures the conversation context using one of nine configurable transformer modes and forwards a leaner payload to the model. Your client sees a standard OpenAI API — no changes required on either side.
+**In the benchmarks below, all three coding modes score 10/10 on the same automated checks as uncompressed `raw` — while sending 4–18% of the tokens.**
 
 ```
 Your client  →  ShapeShifter :8787  →  OpenRouter / DeepSeek / OpenAI / Ollama / …
@@ -120,7 +119,7 @@ UPSTREAM_API_KEY=your-api-key-here
 DEFAULT_MODEL=deepseek/deepseek-v4-flash
 
 # Context compression
-CONTEXT_MODE=hybrid        # hybrid | yaml | incremental | raw | minimal | yaml | json | table | symbolic | matrix
+CONTEXT_MODE=hybrid        # hybrid | yaml | incremental | raw | minimal | json | table | symbolic | matrix
 AUTO_MODE=false            # true = auto-select mode per request
 
 # Logging
@@ -365,16 +364,14 @@ shapeshifter/
 
 ---
 
-## Author
+## Status
 
-**ShapeShifter** was conceived and built by *Gaetano Marcello Incarbone**.
+ShapeShifter is **v0.2, in active testing**. The core idea and design are mine — structural reformulation of context instead of lossy token compression, with language-agnostic coding-session detection and per-provider key management. The implementation was built with heavy AI assistance and hardened by hand.
 
-The core idea — structural reformulation of conversation context rather than lossy compression, with language-agnostic coding-session detection and per-provider key management — originated from his work on reducing LLM costs in multi-turn coding agent workflows.
+Bug reports and independent benchmark reproductions are very welcome — the whole suite runs locally with `--local-only` (no API calls, no key needed). If you can break the numbers, open an issue.
 
-If you build on ShapeShifter, attribution in your README or documentation is appreciated.
+Built by **Gaetano Marcello Incarbone**. If you build on ShapeShifter, attribution in your README or documentation is appreciated.
 
-The idea is entirely human, as are the various attempts to conceptualize, synthesize, visualize, and rationalize the context. The code made heavy use of vibecoding (70% - 75%) and rework until the final result.
-Shapeshifter is still in the testing phase. Please report any anomalies or usability issues. I apologize in advance for any problems.
 ---
 
 ## License
@@ -384,4 +381,3 @@ MIT License © 2026 Marcello Incarbone
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, subject to the condition that the above copyright notice and this permission notice are included in all copies or substantial portions of the Software.
 
 See the [LICENSE](LICENSE) file for the full text.
-
