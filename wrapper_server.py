@@ -23,7 +23,7 @@ from llm_client import call_upstream, stream_upstream
 from mode_selector import choose_mode
 from output_contracts import build_system_prompt, detect_contract_type
 from token_counter import compression_stats, count_tokens
-from transformers import VALID_MODES, apply_transform
+from transformers import VALID_MODES, apply_transform, _extract_retrievable_pieces
 
 load_dotenv()
 
@@ -344,78 +344,97 @@ _FILE_READ_TOOL_NAME = re.compile(r"read.*file|get.*file.*content|cat_file|file_
 _FILE_PATH_ARG_KEYS = ("path", "file_path", "filepath", "file", "filename", "target_file")
 
 
-def _build_tool_call_paths(messages: list[dict]) -> dict[str, str]:
-    """Map tool_call_id -> file path, for tool calls that look like file reads
-    (by function name) and whose arguments carry a recognizable path
-    parameter. Used only to identify *which file* a `tool` result answers, so
-    an unmodified re-read of the same file can be recognized safely — never
-    to guess at content we can't verify.
+def _build_tool_call_keys(messages: list[dict]) -> dict[str, tuple[str, str]]:
+    """Map tool_call_id -> (dedup_key, human_label) for EVERY tool call, not
+    just file reads (Feature 7 — generalizes Feature 1's file-read-only
+    scope). A repeated `execute_command("npm test")` or `search("TODO")`
+    with identical arguments is exactly as safe to dedupe as a repeated
+    `read_file("app.py")`: nothing is lost, the full result still exists
+    later in the same request.
+
+    File-read-like calls (matched by function name, with a resolvable path
+    argument) get a clean filename-based key/label for readability, matching
+    the original behavior. Every other tool call gets a general key built
+    from (function name, canonicalized arguments) and a label using just the
+    function name.
     """
-    paths: dict[str, str] = {}
+    result: dict[str, tuple[str, str]] = {}
     for m in messages:
         if m.get("role") != "assistant":
             continue
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function") or {}
             name = fn.get("name", "")
-            if not _FILE_READ_TOOL_NAME.search(name):
-                continue
+            args_raw = fn.get("arguments") or "{}"
             try:
-                args = json.loads(fn.get("arguments") or "{}")
+                args = json.loads(args_raw)
             except (ValueError, TypeError):
-                continue
-            if not isinstance(args, dict):
-                continue
-            for key in _FILE_PATH_ARG_KEYS:
-                if isinstance(args.get(key), str):
-                    paths[tc.get("id", "")] = args[key]
-                    break
-    return paths
+                args = None
+
+            path = None
+            if _FILE_READ_TOOL_NAME.search(name) and isinstance(args, dict):
+                for key in _FILE_PATH_ARG_KEYS:
+                    if isinstance(args.get(key), str):
+                        path = args[key]
+                        break
+
+            if path:
+                result[tc.get("id", "")] = (f"file:{path}", path)
+            else:
+                canonical_args = json.dumps(args, sort_keys=True) if isinstance(args, dict) else args_raw
+                result[tc.get("id", "")] = (f"call:{name}:{canonical_args}", name)
+    return result
 
 
-def _dedupe_repeated_tool_file_reads(messages: list[dict]) -> list[dict]:
-    """Within a single agentic request, if a file-read tool call returns
-    content for a file that gets read again later in this same message
-    list, keep only the LAST occurrence in full and replace every earlier
-    one with a short marker — whether or not the content actually changed
-    between reads. This mirrors the same "latest wins" retention already
-    applied to assistant/user code in transformers.py
-    (`_extract_latest_artifacts`): only the current state of a file is
-    needed to act on it now, so an earlier read — identical or since
-    superseded — doesn't need to stay in full once a later read of the same
-    path exists.
+def _dedupe_repeated_tool_calls(messages: list[dict]) -> list[dict]:
+    """Within a single agentic request, if ANY tool call is repeated later
+    with the exact same (name, arguments) — not just file reads — keep only
+    the LAST occurrence of that call's result in full and replace every
+    earlier one with a short marker, whether or not the result actually
+    changed between calls. This mirrors the same "latest wins" retention
+    already applied to assistant/user code in transformers.py
+    (`_extract_latest_artifacts`): only the current result of a repeated
+    call is needed to act on it now.
 
-    Messages that aren't `tool` role, or tool calls that don't look like a
-    file read (no resolvable path — see `_build_tool_call_paths`), are left
-    completely untouched. The size guard still applies: a marker never
-    replaces content it isn't actually shorter than.
+    Messages that aren't `tool` role are left completely untouched. The
+    size guard still applies: a marker never replaces content it isn't
+    actually shorter than.
     """
-    tool_paths = _build_tool_call_paths(messages)
-    if not tool_paths:
+    tool_keys = _build_tool_call_keys(messages)
+    if not tool_keys:
         return messages
 
-    last_index_for_path: dict[str, int] = {}
+    last_index_for_key: dict[str, int] = {}
     for i, m in enumerate(messages):
         if m.get("role") != "tool" or not isinstance(m.get("content"), str):
             continue
-        path = tool_paths.get(m.get("tool_call_id", ""))
-        if path:
-            last_index_for_path[path] = i
+        entry = tool_keys.get(m.get("tool_call_id", ""))
+        if entry:
+            last_index_for_key[entry[0]] = i
 
     new_messages: list[dict] = []
     for i, m in enumerate(messages):
         if m.get("role") != "tool" or not isinstance(m.get("content"), str):
             new_messages.append(m)
             continue
-        path = tool_paths.get(m.get("tool_call_id", ""))
-        if path and last_index_for_path.get(path) != i:
-            unchanged = m["content"] == messages[last_index_for_path[path]].get("content")
-            marker = (
-                f"[{path} unchanged since earlier read — content omitted]" if unchanged
-                else f"[{path} read here — since superseded by a later version shown further below]"
-            )
+        entry = tool_keys.get(m.get("tool_call_id", ""))
+        if entry and last_index_for_key.get(entry[0]) != i:
+            key, label = entry
+            unchanged = m["content"] == messages[last_index_for_key[key]].get("content")
+            if key.startswith("file:"):
+                marker = (
+                    f"[{label} unchanged since earlier read — content omitted]" if unchanged
+                    else f"[{label} read here — since superseded by a later version shown further below]"
+                )
+            else:
+                marker = (
+                    f"[{label} call repeated with identical arguments — output unchanged, "
+                    f"see the repeated call's result later in this conversation]" if unchanged
+                    else f"[{label} call repeated with identical arguments — since superseded "
+                         f"by a later result shown further below]"
+                )
             # Never replace with something that isn't actually smaller — for a
-            # tiny file the marker itself can outweigh the content it'd replace.
+            # small result the marker itself can outweigh the content it'd replace.
             if len(marker) < len(m["content"]):
                 new_messages.append({**m, "content": marker})
                 continue
@@ -445,7 +464,7 @@ def _resolve_mode(request_data: dict, http_headers: dict) -> str:
 
 def _build_compressed_messages(
     original_messages: list[dict], mode: str
-) -> tuple[list[dict], str, str]:
+) -> tuple[list[dict], str, str, dict[str, str]]:
     """Compress conversation history for non-agentic (plain chat) requests.
 
     Only messages before the last user turn are compressed. Everything from
@@ -454,6 +473,12 @@ def _build_compressed_messages(
     never stripped. A client-supplied system message (e.g. a client's own
     behavioral prompt) is preserved verbatim and combined with ShapeShifter's
     own directive rather than being discarded.
+
+    The 4th return value is a retrieval map (key -> full content) for
+    everything Feature 2/3 may have collapsed in this turn's compressed
+    history — used by the retrieval tool (Feature 6) to answer the model's
+    own `shapeshifter_expand` calls instantly. Empty for modes that don't do
+    artifact retention.
     """
     client_system = next((m for m in original_messages if m.get("role") == "system"), None)
     non_system    = [m for m in original_messages if m.get("role") != "system"]
@@ -499,7 +524,11 @@ def _build_compressed_messages(
         apply_transform("raw", non_system)[0] if history
         else "\n\n".join(m.get("content", "") for m in current if isinstance(m.get("content"), str))
     )
-    return new_messages, full_raw, transformed_ctx
+    # Only the coding-session modes ever produce a collapsed stub in the
+    # first place — computing this for other modes would inject a tool the
+    # model could never usefully call.
+    retrieval_map = _extract_retrievable_pieces(raw_ctx) if history and mode in ("hybrid", "yaml", "incremental") else {}
+    return new_messages, full_raw, transformed_ctx, retrieval_map
 
 # ---------------------------------------------------------------------------
 # Routes — API
@@ -874,10 +903,98 @@ def _extra_params(body: dict) -> dict:
     return {k: v for k, v in body.items() if k not in _PASSTHROUGH_BODY_KEYS}
 
 
+# ---------------------------------------------------------------------------
+# Feature 6 — retrieval tool: let the model ask back for collapsed content
+# ---------------------------------------------------------------------------
+
+_SHAPESHIFTER_EXPAND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shapeshifter_expand",
+        "description": (
+            "Retrieve the full, current content of a file or function shown "
+            "abbreviated in this conversation as '... unchanged' or a collapsed "
+            "stub. Call this if you need to see or edit something that was "
+            "collapsed, instead of guessing at its content."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "The stub's file name, or file#function for a collapsed function.",
+                },
+            },
+            "required": ["key"],
+        },
+    },
+}
+
+_MAX_RETRIEVAL_ROUNDS = 2
+
+
+async def _resolve_with_retrieval(
+    base_url: str, api_key: str, model: str, messages: list[dict],
+    temperature: float, max_tokens: int, extra: dict, retrieval_map: dict[str, str],
+) -> tuple[dict, float, int]:
+    """Run the model with a synthetic `shapeshifter_expand` tool available,
+    so it can ask back for anything Feature 2/3 collapsed in this request's
+    context instead of guessing. Every call the model makes to that tool is
+    answered instantly from `retrieval_map` — never a real network
+    round-trip — and the loop continues transparently until the model
+    produces a real answer or `_MAX_RETRIEVAL_ROUNDS` is reached, at which
+    point the tool is withdrawn and the model is forced to answer with
+    whatever it has. Returns (final_response, total_latency_ms, rounds_used).
+
+    If the model never calls the tool, this costs exactly one upstream call
+    plus the small fixed size of the tool definition — behaviorally
+    identical to not having this feature at all.
+    """
+    tools = list(extra.get("tools") or []) + [_SHAPESHIFTER_EXPAND_TOOL]
+    working_messages = list(messages)
+    total_latency = 0.0
+
+    for round_num in range(_MAX_RETRIEVAL_ROUNDS):
+        resp, latency_ms = await call_upstream(
+            base_url=base_url, api_key=api_key, model=model, messages=working_messages,
+            temperature=temperature, max_tokens=max_tokens,
+            extra_params={**extra, "tools": tools, "tool_choice": "auto"},
+        )
+        total_latency += latency_ms
+        msg = resp["choices"][0]["message"]
+        calls = [c for c in (msg.get("tool_calls") or [])
+                 if c.get("function", {}).get("name") == "shapeshifter_expand"]
+        if not calls:
+            return resp, total_latency, round_num
+
+        working_messages = working_messages + [msg]
+        for c in calls:
+            try:
+                key = json.loads(c["function"].get("arguments") or "{}").get("key", "")
+            except (ValueError, TypeError):
+                key = ""
+            content = retrieval_map.get(key, f"No collapsed content found for '{key}'.")
+            working_messages.append({"role": "tool", "tool_call_id": c["id"], "content": content})
+
+    # Cap hit — withdraw the tool entirely so the model can't ask again and
+    # is forced to answer with whatever context it's already retrieved.
+    resp, latency_ms = await call_upstream(
+        base_url=base_url, api_key=api_key, model=model, messages=working_messages,
+        temperature=temperature, max_tokens=max_tokens, extra_params=extra,
+    )
+    total_latency += latency_ms
+    return resp, total_latency, _MAX_RETRIEVAL_ROUNDS
+
+
 def _finalize_stats(mode: str, stats: dict, latency_ms: float, request_id: str,
-                     model: str, output_text: str) -> dict:
+                     model: str, output_text: str, retrieval_rounds: int = 0) -> dict:
     """Record stats/logs for a completed request (streamed or not) and return
-    the `_shapeshifter` metrics block to attach to the response."""
+    the `_shapeshifter` metrics block to attach to the response.
+
+    `retrieval_rounds` (Feature 6) is reported honestly rather than hidden:
+    if the model called the retrieval tool, extra round-trips were spent on
+    this request, and the dashboard/logs should show that real cost.
+    """
     output_tokens = count_tokens(output_text)
     if LOG_RESPONSES:
         _log("responses.jsonl", {
@@ -887,9 +1004,13 @@ def _finalize_stats(mode: str, stats: dict, latency_ms: float, request_id: str,
             "latency_ms": round(latency_ms, 1), "status": "success",
             "compression_ratio": stats["compression_ratio"],
             "reduction_pct": stats["reduction_pct"],
+            "retrieval_rounds": retrieval_rounds,
         })
     _record_stats(mode, stats, latency_ms, request_id=request_id, model=model)
-    return {"request_id": request_id, "mode": mode, **stats, "latency_ms": round(latency_ms, 1)}
+    result = {"request_id": request_id, "mode": mode, **stats, "latency_ms": round(latency_ms, 1)}
+    if retrieval_rounds:
+        result["retrieval_rounds"] = retrieval_rounds
+    return result
 
 
 async def _relay_stream(
@@ -955,14 +1076,15 @@ async def chat_completions(request: Request):
     # force raw passthrough of the original message structure instead.
     agentic = _is_agentic(raw_messages, body)
     if agentic:
-        # Structure/roles are kept byte for byte — only an earlier tool-read
-        # of a file that gets read again later in this same request may be
-        # deduplicated, since only the last read is needed to act on it now
-        # (see _dedupe_repeated_tool_file_reads).
-        new_messages = _dedupe_repeated_tool_file_reads(raw_messages)
+        # Structure/roles are kept byte for byte — only an earlier tool call
+        # repeated later in this same request with identical arguments may be
+        # deduplicated, since only the last occurrence is needed to act on it
+        # now (see _dedupe_repeated_tool_calls).
+        new_messages = _dedupe_repeated_tool_calls(raw_messages)
         mode = "raw"
         raw_ctx        = "\n\n".join(_content_as_str(m) for m in raw_messages)
         transformed_ctx = "\n\n".join(_content_as_str(m) for m in new_messages)
+        retrieval_map: dict[str, str] = {}  # Feature 6 is scoped to non-agentic requests only
     else:
         # Normalize multimodal text-only list content to plain strings.
         messages = [
@@ -981,7 +1103,7 @@ async def chat_completions(request: Request):
                 status_code=400,
             )
         try:
-            new_messages, raw_ctx, transformed_ctx = _build_compressed_messages(messages, mode)
+            new_messages, raw_ctx, transformed_ctx, retrieval_map = _build_compressed_messages(messages, mode)
         except Exception as exc:
             return JSONResponse(
                 {"error": {"message": str(exc), "type": "transformation_error"}},
@@ -1032,11 +1154,21 @@ async def chat_completions(request: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    retrieval_rounds = 0
     try:
-        upstream_response, latency_ms = await call_upstream(
-            base_url=UPSTREAM_URL, api_key=UPSTREAM_KEY, model=model,
-            messages=new_messages, temperature=temp, max_tokens=max_tok, extra_params=extra,
-        )
+        if retrieval_map:
+            # Feature 6: something in this turn's context was collapsed —
+            # give the model a way to ask for it back instead of guessing.
+            upstream_response, latency_ms, retrieval_rounds = await _resolve_with_retrieval(
+                base_url=UPSTREAM_URL, api_key=UPSTREAM_KEY, model=model,
+                messages=new_messages, temperature=temp, max_tokens=max_tok,
+                extra=extra, retrieval_map=retrieval_map,
+            )
+        else:
+            upstream_response, latency_ms = await call_upstream(
+                base_url=UPSTREAM_URL, api_key=UPSTREAM_KEY, model=model,
+                messages=new_messages, temperature=temp, max_tokens=max_tok, extra_params=extra,
+            )
     except Exception as exc:
         return JSONResponse(
             {"error": {"message": f"Upstream error: {exc}", "type": "upstream_error"}},
@@ -1049,7 +1181,9 @@ async def chat_completions(request: Request):
     except (KeyError, IndexError, TypeError):
         pass
 
-    upstream_response["_shapeshifter"] = _finalize_stats(mode, stats, latency_ms, request_id, model, output_text)
+    upstream_response["_shapeshifter"] = _finalize_stats(
+        mode, stats, latency_ms, request_id, model, output_text, retrieval_rounds,
+    )
     return JSONResponse(upstream_response)
 
 # ---------------------------------------------------------------------------

@@ -6,31 +6,33 @@ top of its section — update it as work progresses.
 
 ## Status at a glance / where to resume
 
-**Done, tested, verified end-to-end against real OpenRouter:** Features 1, 2,
-3, 4, 5. All merged into the default pipeline. 79/79 tests pass
-(`pytest -q` from repo root). README.md's Benchmark Results / Cost sections
-reflect the current numbers with all five active.
+**Done, tested, verified end-to-end against real OpenRouter:** Features 1–8,
+all of them. All merged into the default pipeline. 93/93 tests pass
+(`pytest -q` from repo root). All 3 benchmark scenarios (HTML, FastAPI,
+edit_debug) were re-run after Features 7 and 8 landed, and README.md's
+Benchmark Results / Cost sections now reflect those numbers. **Confirmed:
+Feature 7 had zero measurable impact** on any of the 3 scenarios, as
+expected — none of them are agentic/tool-call-heavy sessions, so its code
+path never triggers. **Feature 8's impact is confirmed negligible**: HTML
+reduction moved from 52.5–54.0% to 53.3–53.4%, FastAPI from 59.6–61.9% to
+59.6–61.0%, edit_debug from 43.5–45.5% to 41.1–45.3% — all within normal
+run-to-run model stochasticity for these scenarios, not a measurable step
+change. Neither feature needs a dedicated re-run going forward. Feature 6
+doesn't change compression ratios at all — it's a correctness/quality
+mechanism for edit turns that need collapsed content back, not a
+token-savings one.
 
-**Not started — this is the next thing to pick up:** **Feature 6, the
-retrieval tool** (below). Fully designed already, including a synthetic tool
-schema, the internal retry-loop pseudocode, the retrieval-key scheme for
-both whole-file (Feature 2) and per-function (Feature 3) stubs, and a test
-list. Nothing has been implemented yet — no code changes for it exist
-anywhere in transformers.py or wrapper_server.py. Start by:
-1. Add `_extract_retrievable_pieces(context) -> dict[str, str]` to
-   transformers.py (don't change `apply_transform`'s return arity — see the
-   "Where" section under Feature 6 for why).
-2. Thread that map through `_build_compressed_messages` in wrapper_server.py.
-3. Build the synthetic tool + bounded internal loop in `chat_completions`,
-   scoped to non-agentic, non-streaming requests only (see "Scope for a
-   first version" below — this is deliberately narrower than the full idea).
-4. Unit tests first (mock `call_upstream`), then one real end-to-end check
-   before trusting it, same rigor as every other feature in this file.
+**Nothing in this file is open right now.** The only explicitly-deferred
+work is noted under Feature 6's "Left for a future iteration": extending
+the retrieval tool to agentic requests, to streaming requests, and building
+it a dedicated repeatable benchmark scenario (today it has real end-to-end
+proof of correctness — see Feature 6's section — but not an automated
+benchmark the way retention has Scenario 3). If picking that up, start
+there rather than re-deriving the design from scratch.
 
-No other feature in this file has open work. If you're resuming and unsure
-where things stand, run `pytest -q` and check `git diff --stat transformers.py
-wrapper_server.py` against the last commit — everything described as DONE
-below should already be reflected there.
+If you're resuming and unsure where things stand, run `pytest -q` and check
+`git diff --stat transformers.py wrapper_server.py` against the last commit
+— everything described as DONE below should already be reflected there.
 
 Context: this follows the selective-retention work (transformers.py's
 `_extract_latest_artifacts`, keeps latest version per file for USER+ASSISTANT
@@ -467,7 +469,44 @@ the function's own text still has to match exactly for a collapse to happen.
 
 ## Feature 6 — Retrieval tool: let the model ask for collapsed content back
 
-**Status: not started — the ambitious one, inspired by Headroom's CCR ("originals cached, retrievable on demand")**
+**Status: DONE.** Implemented exactly as scoped (non-agentic, non-streaming
+only, bounded to `_MAX_RETRIEVAL_ROUNDS = 2`).
+
+- `transformers.py`: `_extract_retrievable_pieces` (whole-file + per-function
+  keys) and `_clean_declaration_name` (strips modifiers/params from a raw
+  header down to a clean token) — kept fully separate from
+  `apply_transform`, as planned, so no existing caller's return arity
+  changed.
+- `wrapper_server.py`: `_build_compressed_messages` now returns a 4th value
+  (`retrieval_map`) — this DID change that function's arity, but it has only
+  two callers (the main handler and this repo's own tests), both updated.
+  `_SHAPESHIFTER_EXPAND_TOOL` (the synthetic tool schema),
+  `_resolve_with_retrieval` (the bounded loop), and `_finalize_stats` now
+  reports `retrieval_rounds` honestly in `_shapeshifter` stats rather than
+  hiding the extra cost when it's spent.
+
+Tests: 4 unit tests in `tests/test_retrieval_tool.py` mocking
+`call_upstream` (resolves a tool call correctly, handles an unknown key
+gracefully, caps out and forces a final answer, and — the safety-critical
+one — costs exactly one upstream call with zero behavior change when the
+model never calls the tool). Plus 3 unit tests for the retrieval-map
+construction in `test_transformers.py`. 87/87 suite passes.
+
+**Real end-to-end verification (the critical one)**: built a 3-turn session
+where turn 3 requires reusing an exact, non-guessable class-attribute name
+(`_call_tally`) that only exists in a collapsed method from turn 1 — not
+paraphrased anywhere in the cumulative requirements text. Real call against
+OpenRouter: `_shapeshifter.retrieval_rounds` came back as `1` (the model
+genuinely called `shapeshifter_expand`), and the final generated code used
+the exact real attribute name rather than inventing a plausible-sounding
+one. This is the strongest possible confirmation that the mechanism works
+as intended rather than just not crashing.
+
+**Left for a future iteration** (explicitly out of scope for this version,
+not forgotten): agentic requests, streaming requests, and a dedicated
+benchmark scenario (this feature so far has real end-to-end proof of
+correctness but not a repeatable automated benchmark the way Scenario 3 has
+for retention).
 
 ### What
 Today, when Feature 2 or Feature 3 collapses something, the stub text says
@@ -608,3 +647,147 @@ feature here.
 4. **Feature 3** — highest complexity and risk (language-agnostic block
    detection); do this last, and only after building a dedicated adversarial
    benchmark scenario for it the way Scenario 3 was built for retention.
+
+---
+
+## Feature 7 — Generalize tool-call dedup beyond file reads
+
+**Status: DONE.** Implemented as designed: `_build_tool_call_paths` →
+`_build_tool_call_keys` (returns `{id: (dedup_key, human_label)}` — file
+reads keep the clean filename-based key/label for readable markers, every
+other tool call gets `f"call:{name}:{canonical_json_args}"`);
+`_dedupe_repeated_tool_file_reads` → `_dedupe_repeated_tool_calls`. Same
+size guard, same latest-wins logic, same "last occurrence always kept in
+full" invariant — pure scope generalization, no new risk.
+
+Tests updated/added in `tests/test_wrapper_pipeline.py`: the old
+"ignores non-read tools" test flipped to "tracks non-read tools too";
+added different-arguments-get-different-keys, and a full dedupe test for a
+repeated `execute_command`. 93/93 suite passes.
+
+Real end-to-end verification against OpenRouter: an agentic session running
+the same `pytest` command twice with identical output — the first result
+collapsed to `"[execute_command call repeated with identical arguments —
+output unchanged...]"`, the model answered correctly from the last (full)
+occurrence, 40% reduction on that exchange.
+
+---
+
+## Feature 8 — Whitespace-tolerant collapsing for touched-region blocks
+
+**Status: DONE.** Implemented `_normalize_for_comparison` exactly as
+designed (rstrip per line + collapse blank-line runs, used ONLY for the
+equality check — never for what's actually stored/shown). Wired into
+`_collapse_unchanged_blocks`'s collapse condition.
+
+Tests added in `tests/test_transformers.py`: trailing-whitespace-only
+difference still collapses, blank-line-count difference still collapses
+(interesting real finding — the inserted blank line lands at the TAIL of
+the *previous* block, since blocks are split by the next declaration's
+position, and normalizing blank-line runs to one means that block's
+single-vs-double trailing blank line also compares equal — worth knowing if
+extending this further), real reindentation still blocks the collapse
+(regression guard), real token/expression change still blocks the collapse
+(regression guard). 93/93 suite passes.
+
+Real end-to-end verification against OpenRouter: a version pair differing
+only in trailing whitespace + an extra blank line on `add()` (no real
+change) plus a genuine comment addition to `subtract()` — `add()` correctly
+collapsed despite the formatting noise, `subtract()` correctly stayed in
+full, and the model reconstructed a fully correct file. Bonus: the model
+also exercised Feature 6's retrieval tool during this same test
+(`retrieval_rounds: 1`) and still produced the correct answer — confirms
+Features 6 and 8 compose correctly.
+
+### What
+`_dedupe_repeated_tool_file_reads` (wrapper_server.py, Feature 1) only
+tracks tool calls that *look like* a file read (matched via
+`_FILE_READ_TOOL_NAME` against the function name, extracting a `path`
+argument). But the same latest-wins safety principle applies to ANY
+repeated tool call, not just reads: if `execute_command("npm test")` or
+`search("TODO")` is called twice with identical arguments, the earlier
+result is exactly as safe to summarize as an earlier identical file read —
+nothing is lost, the full result still exists later in the same request.
+
+### Design
+Replace the file-read-specific key extraction with a fully general one:
+key a tool call by `f"{function_name}:{canonical_json_args}"` for EVERY
+tool call, not just ones matching a read-like name pattern. Rename
+`_build_tool_call_paths` → `_build_tool_call_keys` and
+`_dedupe_repeated_tool_file_reads` → `_dedupe_repeated_tool_calls` to match
+(honesty about scope, same pattern as `_split_python_blocks` →
+`_split_definition_blocks` earlier). Marker text should reference the tool
+name only (not the raw arguments, which could be long/ugly) — e.g.
+`f"[{name} call repeated with identical arguments — output unchanged, see the repeated call's result later in this conversation]"`. Same size guard, same
+"last occurrence always kept in full" invariant, same "latest wins" logic
+(identical → "unchanged" marker; differing → "superseded" marker) — this is
+a scope generalization, not a new mechanism.
+
+### Safety
+Identical to Feature 1's existing safety argument: a marker only ever
+replaces a message whose (name, arguments) pair repeats later with a
+resolvable last occurrence; nothing is discarded that isn't recoverable
+from later in the same request.
+
+### Tests to update/add
+- Existing "ignores non-read tools" test needs to flip — `execute_command`
+  should now be tracked and deduped like anything else.
+- Two calls to the same tool with the SAME arguments and identical output →
+  earlier one collapses.
+- Two calls to the same tool with the SAME arguments but DIFFERENT output →
+  earlier one collapses with the "superseded" wording.
+- Two calls to the same tool with DIFFERENT arguments → both stay in full
+  (different key, not a dupe).
+
+---
+
+## Feature 8 — Whitespace-tolerant collapsing for touched-region blocks
+
+**Status: not started**
+
+### What
+`_collapse_unchanged_blocks` (Feature 3) requires EXACT string equality
+between a block and its previous version to collapse it — a single
+trailing space or one extra blank line anywhere in an otherwise-identical
+function blocks the collapse entirely. Since trailing whitespace and
+blank-line-run counts are never semantically significant in any mainstream
+language (unlike leading/indentation whitespace, which stays untouched),
+loosening the equality check to ignore just those two things catches more
+real "functionally unchanged" reformatting without any correctness risk.
+
+### Design
+Add `_normalize_for_comparison(text) -> str`: rstrip every line, collapse
+runs of consecutive blank lines to a single blank line. Use this ONLY for
+the equality check in `_collapse_unchanged_blocks` — the actual
+stored/displayed content when a block does NOT collapse is always the real,
+untouched text; normalization never touches what the model actually sees.
+
+```python
+def _normalize_for_comparison(text: str) -> str:
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    normalized, prev_blank = [], False
+    for ln in lines:
+        is_blank = not ln
+        if is_blank and prev_blank:
+            continue
+        normalized.append(ln)
+        prev_blank = is_blank
+    return "\n".join(normalized)
+```
+
+### Safety
+Deliberately narrow: only trailing whitespace and blank-line-run count are
+normalized away — leading (indentation) whitespace is never touched, so a
+real reindentation or structural change still correctly blocks the
+collapse. Any other single-character difference anywhere still blocks it
+too, same as today.
+
+### Tests to add
+- Two versions differing only in trailing whitespace on one line → still
+  collapses.
+- Two versions differing only in blank-line count between statements →
+  still collapses.
+- Two versions differing in indentation (a real reformat) → does NOT
+  collapse (this must still be treated as a real change).
+- Two versions differing in an actual token/expression → does NOT collapse
+  (regression guard — normalization must never mask a real change).

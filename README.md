@@ -279,10 +279,10 @@ Converting the two build-from-scratch benchmarks above into real per-model prici
 
 | Scenario | Raw input tokens | ShapeShifter input tokens | at DeepSeek ($0.09/1M) | at GPT-4o ($2.50/1M) | at Claude Sonnet 4.5 ($3.00/1M) |
 |---|---:|---:|---:|---:|---:|
-| HTML (5 turns, `hybrid`) | ~59,163 | ~27,842 | $0.0053 → $0.0025 | $0.148 → $0.070 | $0.178 → $0.084 |
-| FastAPI (10 turns, `hybrid`) | ~28,307 | ~11,398 | $0.0025 → $0.0010 | $0.071 → $0.028 | $0.085 → $0.034 |
+| HTML (5 turns, `hybrid`) | ~68,169 | ~31,807 | $0.0061 → $0.0029 | $0.170 → $0.080 | $0.205 → $0.095 |
+| FastAPI (10 turns, `hybrid`) | ~29,801 | ~11,631 | $0.0027 → $0.0010 | $0.075 → $0.029 | $0.089 → $0.035 |
 
-Those are small in absolute terms because both scenarios are short, single-file sessions — that's the actual, unpadded cost of the benchmark runs above, not a projection. Real Cline/Continue sessions run longer and touch more files, and the input-token cost of a growing history **compounds every turn** because the full history is resent on every request. The reduction percentage doesn't change with session length — but multiplied by a bigger, realistic base it stops looking like a rounding error: at the 59.7% reduction this suite measured on FastAPI, a session whose *raw* cumulative input cost would have been **$2.10** costs **~$0.85** with ShapeShifter active — same requests, same model, same output, just without re-sending superseded versions of code the model already wrote.
+Those are small in absolute terms because both scenarios are short, single-file sessions — that's the actual, unpadded cost of the benchmark runs above, not a projection. Real Cline/Continue sessions run longer and touch more files, and the input-token cost of a growing history **compounds every turn** because the full history is resent on every request. The reduction percentage doesn't change with session length — but multiplied by a bigger, realistic base it stops looking like a rounding error: at the 61.0% reduction this suite measured on FastAPI, a session whose *raw* cumulative input cost would have been **$2.10** costs **~$0.82** with ShapeShifter active — same requests, same model, same output, just without re-sending superseded versions of code the model already wrote.
 
 **One honest caveat**: turns that use native OpenAI-style function calling (the `tools`/`tool_calls` API, as opposed to Cline's default text-embedded tool protocol) are always forwarded uncompressed by design — ShapeShifter never risks breaking a tool-call chain to save tokens. The $ savings above apply to conversational code-generation turns, which is the majority of a typical session, but a session running heavily in native function-calling mode will see a smaller effective savings rate than these numbers suggest.
 
@@ -302,23 +302,23 @@ A 5-turn session building a complex single-file HTML page: sticky navbar, animat
 
 **10 automated checks** on the final HTML output.
 
-> Re-run with the full retention + touched-region-collapse pipeline (selective retention, plus collapsing unchanged functions to signature stubs — see [Scenario 3](#scenario-3--editdebug-session-adversarial-6-turns)): the reduction % is honestly lower than the drop-all-era numbers this suite used to report, because every turn carries the current file instead of zero code — quality is essentially unaffected.
+> Re-run with the full pipeline (Features 1–8, see `docs/token_savings_roadmap.md`): the reduction % is honestly lower than the drop-all-era numbers this suite used to report, because every turn carries the current file instead of zero code — quality is unaffected.
 
 | Mode | Tokens Saved | Reduction | Latency | Quality |
 |---|---:|---:|---:|---:|
-| `yaml` | 38,775 | **54.0%** | 526s | **10 / 10** |
-| `hybrid` | 31,321 | 52.9% | 1,106s | **10 / 10** |
-| `incremental` | 27,101 | 52.5% | 444s | 9 / 10 |
-| `raw` *(baseline)* | 0 | 0% | 562s | 10 / 10 |
+| `incremental` | 36,838 | **53.4%** | 710s | **10 / 10** |
+| `yaml` | 33,355 | 53.3% | 835s | **10 / 10** |
+| `hybrid` | 36,362 | 53.3% | 945s | **10 / 10** |
+| `raw` *(baseline)* | 0 | 0% | 918s | 10 / 10 |
 
-`incremental` missed one check (`IntersectionObserver`) on this run — investigated and confirmed to be model variance, not a compression regression: the relevant code was present, uncollapsed, in the context actually sent (only one function in the whole session got collapsed, and it wasn't this one). Same category of miss as `raw` scoring 8/10 in an earlier run of this same scenario — accumulating turns can make a model drop an earlier feature regardless of how the context got there.
+An earlier run of this scenario had `incremental` miss one check (`IntersectionObserver`) — investigated and confirmed to be model variance, not a compression regression (the relevant code was present, uncollapsed, in the context actually sent). This run: all four modes 10/10.
 
 ```mermaid
 xychart-beta
     title "HTML Scenario — Tokens used relative to raw = 100 (5 turns, lower is better)"
-    x-axis ["raw (baseline)", "yaml", "hybrid", "incremental"]
+    x-axis ["raw (baseline)", "incremental", "yaml", "hybrid"]
     y-axis "% of raw tokens used" 0 --> 110
-    bar [100, 46.0, 47.1, 47.5]
+    bar [100, 46.6, 46.7, 46.7]
 ```
 
 ---
@@ -329,39 +329,39 @@ A 10-turn session building a production FastAPI server from scratch to 8 endpoin
 
 **10 automated checks** on the final Python output.
 
-> Re-run with the full retention + touched-region-collapse pipeline — same caveat as Scenario 1, plus one more factor specific to this scenario: FastAPI's endpoint handlers are almost all `async def`, which the first pass of touched-region collapsing didn't recognize as a declaration at all (only bare `def`/`class`). Fixed to recognize `async`/`export`/`pub`-prefixed declarations too — see [Key findings](#key-findings) below for the before/after this made.
+> Re-run with the full pipeline (Features 1–8) — same caveat as Scenario 1, plus one more factor specific to this scenario: FastAPI's endpoint handlers are almost all `async def`, which the first pass of touched-region collapsing didn't recognize as a declaration at all (only bare `def`/`class`). Fixed to recognize `async`/`export`/`pub`-prefixed declarations too — see [Key findings](#key-findings) below for the before/after this made.
 
 | Mode | Tokens Saved | Reduction | Latency | Quality |
 |---|---:|---:|---:|---:|
-| `yaml` | 19,146 | **61.9%** | 226s | **10 / 10** |
-| `incremental` | 17,946 | 59.8% | 172s | **10 / 10** |
-| `hybrid` | 16,909 | 59.7% | **117s** | **10 / 10** |
-| `raw` *(baseline)* | 0 | 0% | 131s | 10 / 10 |
+| `hybrid` | 18,170 | **61.0%** | 194s | **10 / 10** |
+| `yaml` | 17,991 | 60.2% | 220s | **10 / 10** |
+| `incremental` | 17,261 | 59.6% | 194s | **10 / 10** |
+| `raw` *(baseline)* | 0 | 0% | **149s** | 10 / 10 |
 
 ```mermaid
 xychart-beta
     title "FastAPI Scenario — Tokens used relative to raw = 100 (10 turns, lower is better)"
-    x-axis ["raw (baseline)", "yaml", "incremental", "hybrid"]
+    x-axis ["raw (baseline)", "hybrid", "yaml", "incremental"]
     y-axis "% of raw tokens used" 0 --> 110
-    bar [100, 38.1, 40.2, 40.3]
+    bar [100, 39.0, 39.8, 40.4]
 ```
 
 ```mermaid
 xychart-beta
     title "FastAPI Scenario — Total latency in seconds (10 turns, lower is better)"
-    x-axis ["hybrid", "incremental", "raw (baseline)", "yaml"]
+    x-axis ["raw (baseline)", "hybrid", "incremental", "yaml"]
     y-axis "Seconds" 0 --> 250
-    bar [117, 172, 131, 226]
+    bar [149, 194, 194, 220]
 ```
 
-> **`hybrid` used only 40.3% of the tokens that `raw` would send — and finished slightly faster too (117s vs 131s).** Less context can mean less time for the model to process it, though this isn't guaranteed: the HTML scenario above shows the opposite (retention's larger per-turn context ran slower than raw there). Take the speed numbers as scenario-specific, not a general law — the token reduction is the reliable part.
+> **`hybrid` used only 39.0% of the tokens that `raw` would send.** Latency didn't follow this time — `raw` was actually the fastest mode on this run (149s vs 194s for `hybrid`), the opposite of what an earlier run of this same scenario showed. Speed is genuinely scenario- and run-dependent in both directions; the token reduction is the reliable, repeatable part.
 
 ```mermaid
 xychart-beta
     title "Token efficiency — % of raw tokens used across both scenarios (lower is better)"
-    x-axis ["raw", "yaml (HTML)", "hybrid (HTML)", "incremental (HTML)", "yaml (FastAPI)", "incremental (FastAPI)", "hybrid (FastAPI)"]
+    x-axis ["raw", "incremental (HTML)", "yaml (HTML)", "hybrid (HTML)", "hybrid (FastAPI)", "yaml (FastAPI)", "incremental (FastAPI)"]
     y-axis "% of raw tokens used" 0 --> 110
-    bar [100, 46.0, 47.1, 47.5, 38.1, 40.2, 40.3]
+    bar [100, 46.6, 46.7, 46.7, 39.0, 39.8, 40.4]
 ```
 
 > *All bars show tokens sent to the upstream model as a percentage of what `raw` mode would send.*
@@ -378,10 +378,10 @@ This is why `hybrid`, `yaml`, and `incremental` no longer discard **all** genera
 
 | Mode | Tokens Saved | Reduction | Latency | Checks |
 |---|---:|---:|---:|---:|
-| `yaml` | 2,818 | **45.5%** | 66.4s | **10 / 10** |
-| `hybrid` | 2,545 | 45.0% | 32.5s | **10 / 10** |
-| `incremental` | 2,511 | 43.5% | 67.0s | **10 / 10** |
-| `raw` *(baseline)* | 0 | 0% | 47.4s | **10 / 10** |
+| `hybrid` | 2,856 | **45.3%** | 67.9s | **10 / 10** |
+| `incremental` | 2,649 | 43.1% | **41.6s** | **10 / 10** |
+| `yaml` | 2,314 | 41.1% | 92.1s | **10 / 10** |
+| `raw` *(baseline)* | 0 | 0% | 57.5s | **10 / 10** |
 
 **Honestly delimiting the claim:** on the run that established this scenario, with `deepseek/deepseek-v4-flash`, every mode — including a from-source rebuild of the *old* drop-all behavior we ran side-by-side for comparison — scored 10/10 on the automated checks. Drop-all actually saved *more* tokens on that run (70.3%) than retention did at the time (38–43%, before the touched-region collapsing below existed), because this scenario's edit instructions are fully specified in text (both the old and new name are spelled out, e.g. "rename `history` to `operation_log`"), so a capable model can often satisfy them by regenerating a plausible file from the requirements list alone — the automated regex checks can't tell "correctly edited" apart from "successfully guessed." Touched-region collapsing (below) has since narrowed that gap to 43.5–45.5% without changing this underlying finding.
 
@@ -397,10 +397,10 @@ Reproduce this locally: `python benchmark_coding.py --scenario benchmarks/scenar
 
 ### Key findings
 
-- **Quality holds across all three scenarios** — 9–10/10 checks in every mode, including `raw`; the one miss (`incremental`, HTML) was confirmed to be model variance, not something compression caused (see Scenario 1)
-- **Token savings sit in a 38–57% band across all three scenarios** — 46–48% on 5-turn build-from-scratch HTML, 38–40% on 10-turn build-from-scratch FastAPI, 54–57% on a 6-turn session that's half edit/debug (expressed here as % of raw tokens actually *sent*, i.e. lower is better — reduction was 43–46% and 60–62% respectively). This is markedly lower than the ~82–95% this suite reported before selective retention replaced drop-all — that was the honest cost of the fix (see Scenario 3): every turn now carries the latest full file instead of zero code, which is what makes edit turns answerable at all.
+- **Quality holds across all three scenarios** — 10/10 checks in every mode, including `raw`, on this run
+- **Token savings sit in a 39–59% band across all three scenarios** — 47% on 5-turn build-from-scratch HTML, 39–40% on 10-turn build-from-scratch FastAPI, 55–59% on a 6-turn session that's half edit/debug (expressed here as % of raw tokens actually *sent*, i.e. lower is better — reduction was 53–53%, 60–61%, and 41–45% respectively). This is markedly lower than the ~82–95% this suite reported before selective retention replaced drop-all — that was the honest cost of the fix (see Scenario 3): every turn now carries the latest full file instead of zero code, which is what makes edit turns answerable at all.
 - **Touched-region collapsing recovers some of that cost** by collapsing functions/methods unchanged since the previous version to a signature stub, on top of retention — see Scenario 3 for the measured before/after and the `async def` bug that initially limited its effect on FastAPI.
-- **Speed effects are scenario-dependent, not a general rule**: in FastAPI, `hybrid` finished slightly faster than `raw` (117s vs 131s). In HTML, `hybrid` was notably slower than `raw` (1,106s vs 562s) — retention's larger per-turn context (the full page, kept live every turn) outweighed any benefit there. Don't assume compression implies a latency win; measure it for your own workload.
+- **Speed doesn't correlate cleanly with token reduction — it's scenario- and run-dependent, not a general rule.** On this run: HTML's `incremental` was the fastest mode overall (710s, faster than `raw`'s 918s) while `hybrid` was the slowest (945s); FastAPI's `raw` baseline (149s) was faster than all three compression modes (194–220s) — the reverse of an earlier run of the same scenario, where `hybrid` had been faster than `raw`; edit_debug's `incremental` (42s) beat `raw` (58s) while `yaml` (92s) was slowest. Don't assume compression implies a latency win in either direction; measure it for your own workload.
 - All three coding-session modes (`hybrid`, `yaml`, `incremental`) work the same way: **keep only the latest version of each file touched so far**, with unchanged functions/methods further collapsed to a stub once a previous version exists to compare against, and **keep all user requirements verbatim**. The current user message is always forwarded intact and never compressed.
 - **Language detection is universal**: Python, JavaScript, TypeScript, Rust, Go, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin, SQL, HTML and any fenced code block are auto-detected — no configuration needed, and the same keyword set drives both coding-session detection and touched-region collapsing
 
@@ -410,9 +410,11 @@ ShapeShifter compresses only the **conversation history**, never the current use
 
 **Untouched files collapse to a one-line stub, not silence.** In a session with multiple files, a retained artifact only stays fully expanded if the current turn mentions its filename *or* one of the classes/functions it declares (so "fix the User model" matches `models.py` via `class User` even without ever naming the file) — otherwise it's shown as `main.py: 12 lines, unchanged since last shown — ask to see it again if needed`, explicitly inviting the model to ask rather than silently going quiet about a file it knows exists. A size guard skips this for files small enough that the stub wouldn't actually be shorter.
 
-**Within a Python file, unchanged methods collapse individually, not just unchanged whole files.** When a retained file has a previous version to compare against, `hybrid`/`yaml`/`incremental` diff the two and collapse only the methods/functions that are byte-identical between them to a one-line `def divide(self, a, b):\n        ...  # unchanged since previous version` stub — the method that actually changed (or is new) always stays in full. The collapse condition is exact equality, not proximity to a diff, so there's no risk of trimming part of a method that changed. This only applies to Python-style (`def`/`class`) code today; anything else keeps the whole file, which is a no-op, not a risk.
+**Unchanged methods/functions collapse individually, not just unchanged whole files.** When a retained file has a previous version to compare against, `hybrid`/`yaml`/`incremental` diff the two and collapse only the methods/functions that are unchanged between them to a one-line `def divide(self, a, b):\n        ...  # unchanged since previous version` stub — the function that actually changed (or is new) always stays in full. "Unchanged" means equal after ignoring trailing whitespace and blank-line-run differences (never semantically significant in any mainstream language) — a purely-reformatted function still collapses, a real reindentation or token change still doesn't. Recognizes declarations across Python, JS/TS, Rust, Go, Kotlin/Swift, and C-family languages (including `async`/`export`/`pub`-modified ones); anything else keeps the whole file, which is a no-op, not a risk.
 
-**Native function-calling turns are a deliberate exception.** When a request uses the `tools`/`tool_calls` API (as opposed to Cline's default text-embedded tool protocol), ShapeShifter forwards the message structure completely untouched — no compression at all — to protect the tool-call chain. The one narrow exception: if a `read_file`-style tool call reads a file that gets read again later in that same request, every occurrence but the last is replaced with a short marker — same "latest wins" rule the retention mechanism already applies to assistant/user code, just extended to tool results. Only the last read of a given file is ever needed to act on it now, so this applies whether the re-read came back unchanged or the file had since been edited; a size guard skips the swap entirely when the file is small enough that the marker wouldn't actually be smaller.
+**If something was collapsed, the model can ask for it back — and does.** A small tool (`shapeshifter_expand`) is added to non-streaming requests whenever this turn's context contains a collapsed stub. If the model decides a stub isn't enough — say, an edit needs to reuse an exact identifier from a collapsed method — it calls the tool with the stub's key, and ShapeShifter answers instantly from data already computed for this request (no second network round-trip to anything). The exchange is fully transparent to the caller: they see one normal completion, and `_shapeshifter.retrieval_rounds` in the response honestly reports whether (and how many times) this happened. If the model never calls it, there's no behavior change beyond the tool definition's small fixed token cost. Verified end-to-end: a session where reusing an exact, non-guessable attribute name from a collapsed method was required — the model retrieved it and used the real name rather than inventing a plausible one.
+
+**Native function-calling turns are a deliberate exception.** When a request uses the `tools`/`tool_calls` API (as opposed to Cline's default text-embedded tool protocol), ShapeShifter forwards the message structure completely untouched — no compression at all — to protect the tool-call chain. The one exception: if *any* tool call — a file read, a shell command, a search, anything — repeats later in that same request with the exact same arguments, every occurrence but the last is replaced with a short marker — same "latest wins" rule the retention mechanism already applies to assistant/user code, just extended to tool results. Only the last occurrence of a given call is ever needed to act on it now, so this applies whether the repeat came back unchanged or the result had since changed; a size guard skips the swap entirely when the result is small enough that the marker wouldn't actually be smaller. Verified with a repeated `execute_command` re-running the same test suite: the stale result collapsed, the model answered correctly from the fresh one, 40% off that exchange.
 
 ---
 

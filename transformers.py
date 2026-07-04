@@ -330,13 +330,38 @@ def _find_block_end_by_indent(lines: list[str], start: int, header_indent: int) 
     return len(lines)
 
 
+def _normalize_for_comparison(text: str) -> str:
+    """Normalize away formatting noise that's never semantically significant
+    in any mainstream language, for the sole purpose of the equality check
+    in `_collapse_unchanged_blocks` — trailing whitespace on a line, and
+    runs of consecutive blank lines. Leading (indentation) whitespace is
+    deliberately never touched: a real reindentation or structural change
+    must still block the collapse. The actual stored/displayed content when
+    a block does NOT collapse is always the real, untouched text — this
+    function is never used to alter what the model sees, only to decide
+    whether two versions count as "unchanged."
+    """
+    normalized: list[str] = []
+    prev_blank = False
+    for line in text.splitlines():
+        stripped = line.rstrip()
+        is_blank = not stripped
+        if is_blank and prev_blank:
+            continue
+        normalized.append(stripped)
+        prev_blank = is_blank
+    return "\n".join(normalized)
+
+
 def _collapse_unchanged_blocks(prev: str, current: str) -> str:
-    """Collapse function/method/type blocks in `current` that are EXACTLY
-    byte-identical to a same-named block in `prev` down to a signature-only
-    stub; every block that changed, is new, or can't be matched by name
-    stays in full. The collapse condition is exact string equality — not
-    proximity to a diff — so there is no risk of discarding part of a block
-    that actually changed.
+    """Collapse function/method/type blocks in `current` that are unchanged
+    from a same-named block in `prev` down to a signature-only stub; every
+    block that changed, is new, or can't be matched by name stays in full.
+    "Unchanged" means equal after normalizing away trailing whitespace and
+    blank-line-run differences (see `_normalize_for_comparison`) — neither
+    is ever semantically significant, so a block reformatted only in those
+    ways still collapses. Any other difference, including a real
+    reindentation, still blocks the collapse exactly as before.
 
     Falls back to returning `current` completely unchanged whenever block
     splitting isn't confident: no recognized declaration keyword found (see
@@ -360,7 +385,11 @@ def _collapse_unchanged_blocks(prev: str, current: str) -> str:
         # whose methods are split out as separate blocks right after it) has
         # nothing worth collapsing — skip it rather than emit a redundant stub.
         header_only = block_text.count("\n") <= 1
-        if not header_only and header in prev_by_header and prev_by_header[header] == block_text:
+        unchanged = (
+            not header_only and header in prev_by_header
+            and _normalize_for_comparison(prev_by_header[header]) == _normalize_for_comparison(block_text)
+        )
+        if unchanged:
             base_indent = len(header) - len(header.lstrip(" "))
             stub_indent = " " * (base_indent + 4)
             out.append(f"{header}\n{stub_indent}...  # unchanged since previous version\n")
@@ -387,6 +416,56 @@ def _extract_latest_artifacts_collapsed(context: str) -> dict[str, str]:
         else:
             result[key] = history[-1]
     return result
+
+
+_DECL_NAME = re.compile(
+    r'(?:async\s+|export\s+|default\s+|pub\s+)*(?:'
+    r'def|function|fn|fun|func|sub|proc|class|struct|interface|enum|impl|trait'
+    r')\s+(\w+)',
+    re.IGNORECASE,
+)
+
+
+def _clean_declaration_name(header: str) -> str:
+    """Extract just the function/type name from a raw declaration header
+    line (stripping modifiers, parameters, and trailing `{`/`:`) — a clean
+    token the model can echo back in a retrieval-tool call, rather than the
+    whole raw header string. Returns "" if no name can be extracted (should
+    not happen for a header that already matched `_DEF_LINE`, but callers
+    should treat an empty result as "don't register a retrieval key for
+    this block" rather than guessing).
+    """
+    m = _DECL_NAME.search(header)
+    return m.group(1) if m else ""
+
+
+def _extract_retrievable_pieces(context: str) -> dict[str, str]:
+    """Inventory of everything Feature 2/3 might collapse in this context,
+    keyed the way the retrieval tool (Feature 6) expects: the artifact key
+    alone for a whole-file stub, or `f"{artifact_key}#{function_name}"` for
+    a collapsed function within it. Lets ShapeShifter answer the model's own
+    retrieval-tool calls instantly from data already computed for this
+    request, instead of re-deriving what got collapsed at call time.
+
+    Always includes the whole-file entry for every tracked artifact — even
+    ones that ended up fully expanded this turn — since the caller doesn't
+    know in advance whether Feature 2 will decide to collapse it (that
+    depends on the current turn's text, resolved later in the pipeline).
+    """
+    versions = _extract_artifact_versions(context)
+    pieces: dict[str, str] = {}
+    for key, history in versions.items():
+        current = history[-1]
+        pieces[key] = current
+        if len(history) == 2:
+            prev_headers = {h for h, _ in _split_definition_blocks(history[0]) if h is not None}
+            for header, block_text in _split_definition_blocks(current):
+                if header is None or header not in prev_headers:
+                    continue
+                name = _clean_declaration_name(header)
+                if name:
+                    pieces[f"{key}#{name}"] = block_text
+    return pieces
 
 
 _TOPLEVEL_IDENT = re.compile(

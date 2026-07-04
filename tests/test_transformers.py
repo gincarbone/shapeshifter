@@ -6,10 +6,12 @@ from transformers import (
     TRANSFORMERS,
     VALID_MODES,
     _artifact_key,
+    _clean_declaration_name,
     _collapse_unchanged_blocks,
     _extract_artifact_versions,
     _extract_latest_artifacts,
     _extract_latest_artifacts_collapsed,
+    _extract_retrievable_pieces,
     _extract_user_requirements,
     _format_artifacts_block,
     _is_coding_session,
@@ -465,6 +467,47 @@ def test_collapse_unchanged_blocks_falls_back_for_single_block_file():
     assert result == single  # only one block total — nothing meaningful to collapse
 
 
+# ---------------------------------------------------------------------------
+# Whitespace-tolerant collapsing (Feature 8)
+# ---------------------------------------------------------------------------
+
+def test_collapse_unchanged_blocks_ignores_trailing_whitespace_difference():
+    v1 = _CALC_V1
+    v2 = _CALC_V1.replace("return a + b", "return a + b   ")  # trailing spaces added to add()'s body
+    result = _collapse_unchanged_blocks(v1, v2)
+    assert "return a + b" not in result  # add() still collapses despite the trailing whitespace
+    assert "unchanged since previous version" in result
+
+
+def test_collapse_unchanged_blocks_ignores_blank_line_count_difference():
+    v1 = _CALC_V1
+    v2 = _CALC_V1.replace(
+        "    def subtract(self, a, b):",
+        "\n    def subtract(self, a, b):",  # one extra blank line before subtract()
+    )
+    result = _collapse_unchanged_blocks(v1, v2)
+    # The extra blank line lands at the tail of add()'s block (blocks are
+    # split by the position of the NEXT declaration) — normalizing blank-line
+    # RUNS to one means add()'s single-vs-double trailing blank line still
+    # compares equal, so add(), subtract(), and multiply() all still collapse.
+    assert result.count("unchanged since previous version") == 3
+
+
+def test_collapse_unchanged_blocks_still_blocks_on_real_reindentation():
+    v1 = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n"
+    v2 = "def add(a, b):\n        return a + b\n\ndef sub(a, b):\n    return a - b\n"  # add() re-indented
+    result = _collapse_unchanged_blocks(v1, v2)
+    assert "        return a + b" in result  # add() stays in full — indentation is a real change
+    assert result.count("unchanged since previous version") == 1  # only sub() collapses
+
+
+def test_collapse_unchanged_blocks_still_blocks_on_real_token_change():
+    v1 = _CALC_V1
+    v2 = _CALC_V1.replace("return a + b", "return a + b + 1")  # a real semantic change
+    result = _collapse_unchanged_blocks(v1, v2)
+    assert "return a + b + 1" in result  # add() stays in full — this is a real change, not noise
+
+
 def test_extract_artifact_versions_keeps_last_two_only():
     ctx = (
         "[ASSISTANT]\n```python\n# app.py\nv1 = 1\n```\n\n"
@@ -494,3 +537,44 @@ def test_extract_latest_artifacts_collapsed_second_version_collapses_unchanged_m
     result = artifacts["__lang__:python"]
     assert "FIXED" in result
     assert "return a + b" not in result
+
+
+# ---------------------------------------------------------------------------
+# Retrieval map for the retrieval tool (Feature 6)
+# ---------------------------------------------------------------------------
+
+def test_clean_declaration_name_strips_modifiers_and_params():
+    assert _clean_declaration_name("    def add(self, a, b):") == "add"
+    assert _clean_declaration_name("async def get_items():") == "get_items"
+    assert _clean_declaration_name("export default function App() {") == "App"
+    assert _clean_declaration_name("pub fn add(a: i32, b: i32) -> i32 {") == "add"
+    assert _clean_declaration_name("class Calculator:") == "Calculator"
+
+
+def test_extract_retrievable_pieces_whole_file_entry_always_present():
+    ctx = "[ASSISTANT]\n```python\n# app.py\ndef add(a, b):\n    return a + b\n```"
+    pieces = _extract_retrievable_pieces(ctx)
+    assert "app.py" in pieces
+    assert "def add" in pieces["app.py"]
+
+
+def test_extract_retrievable_pieces_includes_per_function_keys_on_second_version():
+    v1 = _CALC_V1
+    v2 = _CALC_V1.replace("return a - b", "return a - b  # FIXED")
+    ctx = (
+        f"[ASSISTANT]\n```python\n{v1}```\n\n"
+        "[USER]\nfix it\n\n"
+        f"[ASSISTANT]\n```python\n{v2}```"
+    )
+    pieces = _extract_retrievable_pieces(ctx)
+    assert "__lang__:python#add" in pieces
+    assert "return a + b" in pieces["__lang__:python#add"]
+    assert "__lang__:python#subtract" in pieces
+    assert "FIXED" in pieces["__lang__:python#subtract"]
+
+
+def test_extract_retrievable_pieces_no_per_function_keys_on_first_version():
+    # Nothing to diff against yet — only the whole-file entry should exist.
+    ctx = f"[ASSISTANT]\n```python\n{_CALC_V1}```"
+    pieces = _extract_retrievable_pieces(ctx)
+    assert not any("#" in k for k in pieces)

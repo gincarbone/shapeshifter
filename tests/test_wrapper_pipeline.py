@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from wrapper_server import (
     _build_compressed_messages,
-    _build_tool_call_paths,
-    _dedupe_repeated_tool_file_reads,
+    _build_tool_call_keys,
+    _dedupe_repeated_tool_calls,
     _extra_params,
     _is_agentic,
 )
@@ -69,14 +69,14 @@ def test_client_system_message_is_preserved_and_combined():
         {"role": "system", "content": "CLIENT_MARKER: always say hi"},
         {"role": "user", "content": "generate a function"},
     ]
-    new_messages, _, _ = _build_compressed_messages(messages, "hybrid")
+    new_messages, _, _, _ = _build_compressed_messages(messages, "hybrid")
     system_msg = next(m for m in new_messages if m["role"] == "system")
     assert "CLIENT_MARKER: always say hi" in system_msg["content"]
 
 
 def test_no_client_system_message_still_works():
     messages = [{"role": "user", "content": "generate a function"}]
-    new_messages, _, _ = _build_compressed_messages(messages, "hybrid")
+    new_messages, _, _, _ = _build_compressed_messages(messages, "hybrid")
     assert new_messages[0]["role"] == "system"
     assert new_messages[-1]["content"] == "generate a function"
 
@@ -90,7 +90,7 @@ def test_messages_after_last_user_turn_are_not_dropped():
         {"role": "user", "content": "second turn"},
         {"role": "assistant", "content": "trailing note after the last user message"},
     ]
-    new_messages, _, _ = _build_compressed_messages(messages, "hybrid")
+    new_messages, _, _, _ = _build_compressed_messages(messages, "hybrid")
     tail_contents = [m.get("content") for m in new_messages]
     assert "second turn" in tail_contents
     assert "trailing note after the last user message" in tail_contents
@@ -119,8 +119,10 @@ def test_extra_params_empty_when_only_handled_fields_present():
 
 
 # ---------------------------------------------------------------------------
-# Tool file-read deduplication (only removes an exact, unmodified re-read —
-# never a version that differs, and never anything but `tool` messages)
+# Tool-call deduplication (Feature 1 + Feature 7 — generalized beyond file
+# reads to any repeated tool call with identical arguments). Only removes an
+# exact, unmodified-or-superseded LATER-resolvable occurrence — never
+# anything but `tool` messages, and the last occurrence always stays full.
 # ---------------------------------------------------------------------------
 
 def _read_file_call(call_id, path):
@@ -128,29 +130,47 @@ def _read_file_call(call_id, path):
             "function": {"name": "read_file", "arguments": f'{{"path": "{path}"}}'}}
 
 
-def test_build_tool_call_paths_extracts_path_from_read_file_call():
+def _generic_call(call_id, name, args_json):
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": args_json}}
+
+
+def test_build_tool_call_keys_extracts_path_from_read_file_call():
     messages = [
         {"role": "assistant", "content": None, "tool_calls": [_read_file_call("1", "src/app.py")]},
     ]
-    assert _build_tool_call_paths(messages) == {"1": "src/app.py"}
+    assert _build_tool_call_keys(messages) == {"1": ("file:src/app.py", "src/app.py")}
 
 
-def test_build_tool_call_paths_ignores_non_read_tools():
+def test_build_tool_call_keys_tracks_non_read_tools_too():
+    # Feature 7: generalized beyond file reads — any tool call gets a key.
     messages = [
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command": "ls"}'}},
         ]},
     ]
-    assert _build_tool_call_paths(messages) == {}
+    key, label = _build_tool_call_keys(messages)["1"]
+    assert label == "execute_command"
+    assert key.startswith("call:execute_command:")
 
 
-def test_build_tool_call_paths_recognizes_alternate_path_arg_names():
+def test_build_tool_call_keys_recognizes_alternate_path_arg_names():
     messages = [
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "1", "type": "function", "function": {"name": "get_file_content", "arguments": '{"filename": "x.py"}'}},
         ]},
     ]
-    assert _build_tool_call_paths(messages) == {"1": "x.py"}
+    assert _build_tool_call_keys(messages) == {"1": ("file:x.py", "x.py")}
+
+
+def test_build_tool_call_keys_different_arguments_get_different_keys():
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command": "ls"}'}},
+            {"id": "2", "type": "function", "function": {"name": "execute_command", "arguments": '{"command": "pwd"}'}},
+        ]},
+    ]
+    keys = _build_tool_call_keys(messages)
+    assert keys["1"][0] != keys["2"][0]  # different arguments -> different dedup key
 
 
 def test_dedupe_replaces_earlier_identical_read_keeps_last_in_full():
@@ -164,7 +184,7 @@ def test_dedupe_replaces_earlier_identical_read_keeps_last_in_full():
         {"role": "assistant", "content": None, "tool_calls": [_read_file_call("2", "app.py")]},
         {"role": "tool", "tool_call_id": "2", "content": file_content},  # unmodified re-read
     ]
-    result = _dedupe_repeated_tool_file_reads(messages)
+    result = _dedupe_repeated_tool_calls(messages)
     first_tool_msg = next(m for m in result if m.get("tool_call_id") == "1")
     last_tool_msg = next(m for m in result if m.get("tool_call_id") == "2")
     assert first_tool_msg["content"] != file_content
@@ -184,7 +204,7 @@ def test_dedupe_three_reads_only_last_stays_full():
         {"role": "assistant", "content": None, "tool_calls": [_read_file_call("3", "app.py")]},
         {"role": "tool", "tool_call_id": "3", "content": v3},
     ]
-    result = _dedupe_repeated_tool_file_reads(messages)
+    result = _dedupe_repeated_tool_calls(messages)
     by_id = {m["tool_call_id"]: m["content"] for m in result if m.get("role") == "tool"}
     assert by_id["1"] != v1 and "superseded" in by_id["1"]
     assert by_id["2"] != v2 and "superseded" in by_id["2"]
@@ -201,7 +221,7 @@ def test_dedupe_size_guard_skips_files_smaller_than_the_marker():
         {"role": "assistant", "content": None, "tool_calls": [_read_file_call("2", "x.py")]},
         {"role": "tool", "tool_call_id": "2", "content": tiny_content},
     ]
-    result = _dedupe_repeated_tool_file_reads(messages)
+    result = _dedupe_repeated_tool_calls(messages)
     assert result == messages
 
 
@@ -217,7 +237,7 @@ def test_dedupe_replaces_earlier_differing_read_too_keeps_last_in_full():
         {"role": "assistant", "content": None, "tool_calls": [_read_file_call("2", "app.py")]},
         {"role": "tool", "tool_call_id": "2", "content": new_content},  # file changed since
     ]
-    result = _dedupe_repeated_tool_file_reads(messages)
+    result = _dedupe_repeated_tool_calls(messages)
     first_tool_msg = next(m for m in result if m.get("tool_call_id") == "1")
     last_tool_msg = next(m for m in result if m.get("tool_call_id") == "2")
     assert first_tool_msg["content"] != old_content
@@ -235,23 +255,38 @@ def test_dedupe_size_guard_applies_to_differing_reads_too():
         {"role": "assistant", "content": None, "tool_calls": [_read_file_call("2", "x.py")]},
         {"role": "tool", "tool_call_id": "2", "content": "x = 2\n"},
     ]
-    result = _dedupe_repeated_tool_file_reads(messages)
+    result = _dedupe_repeated_tool_calls(messages)
     assert result == messages
 
 
-def test_dedupe_ignores_non_file_read_tool_calls():
+def test_dedupe_now_covers_non_file_tool_calls_too():
+    # Feature 7: a repeated execute_command with the SAME arguments and
+    # identical output is exactly as safe to dedupe as a repeated file read.
+    output = "PASS test_add\nPASS test_sub\nPASS test_mul\n" * 10  # realistic size, bypasses the guard
     messages = [
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command": "ls"}'}},
-        ]},
-        {"role": "tool", "tool_call_id": "1", "content": "file1.py\nfile2.py"},
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "2", "type": "function", "function": {"name": "execute_command", "arguments": '{"command": "ls"}'}},
-        ]},
-        {"role": "tool", "tool_call_id": "2", "content": "file1.py\nfile2.py"},  # identical output, but not a file read
+        {"role": "assistant", "content": None, "tool_calls": [_generic_call("1", "execute_command", '{"command": "pytest"}')]},
+        {"role": "tool", "tool_call_id": "1", "content": output},
+        {"role": "assistant", "content": None, "tool_calls": [_generic_call("2", "execute_command", '{"command": "pytest"}')]},
+        {"role": "tool", "tool_call_id": "2", "content": output},  # identical re-run, same command
     ]
-    result = _dedupe_repeated_tool_file_reads(messages)
-    assert result == messages  # no read_file-like tool involved — must not touch
+    result = _dedupe_repeated_tool_calls(messages)
+    first_tool_msg = next(m for m in result if m.get("tool_call_id") == "1")
+    last_tool_msg = next(m for m in result if m.get("tool_call_id") == "2")
+    assert first_tool_msg["content"] != output
+    assert "unchanged" in first_tool_msg["content"] and "execute_command" in first_tool_msg["content"]
+    assert last_tool_msg["content"] == output  # last occurrence always kept in full
+
+
+def test_dedupe_non_file_tool_calls_with_different_arguments_stay_untouched():
+    # Different command -> different dedup key -> not a dupe at all.
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [_generic_call("1", "execute_command", '{"command": "pytest"}')]},
+        {"role": "tool", "tool_call_id": "1", "content": "PASS" * 50},
+        {"role": "assistant", "content": None, "tool_calls": [_generic_call("2", "execute_command", '{"command": "ls -la"}')]},
+        {"role": "tool", "tool_call_id": "2", "content": "PASS" * 50},
+    ]
+    result = _dedupe_repeated_tool_calls(messages)
+    assert result == messages  # different arguments -> not the same call, never dedupe
 
 
 def test_dedupe_does_not_touch_non_tool_messages():
@@ -260,4 +295,4 @@ def test_dedupe_does_not_touch_non_tool_messages():
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
     ]
-    assert _dedupe_repeated_tool_file_reads(messages) == messages
+    assert _dedupe_repeated_tool_calls(messages) == messages

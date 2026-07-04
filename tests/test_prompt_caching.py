@@ -27,8 +27,8 @@ def test_contract_type_is_frozen_to_the_first_user_turn():
         {"role": "user", "content": "there's an error in production, please fix it"},
     ]
 
-    new_messages_1, _, _ = _build_compressed_messages(messages_turn1, "hybrid")
-    new_messages_2, _, _ = _build_compressed_messages(messages_turn2, "hybrid")
+    new_messages_1, _, _, _ = _build_compressed_messages(messages_turn1, "hybrid")
+    new_messages_2, _, _, _ = _build_compressed_messages(messages_turn2, "hybrid")
 
     system_1 = next(m["content"] for m in new_messages_1 if m["role"] == "system")
     system_2 = next(m["content"] for m in new_messages_2 if m["role"] == "system")
@@ -68,8 +68,8 @@ def test_growing_history_prefix_stays_stable_across_turns():
         {"role": "user", "content": "Now add mul(a,b) too."},
     ]
 
-    _, _, transformed_2 = _build_compressed_messages(turn2, "hybrid")
-    _, _, transformed_3 = _build_compressed_messages(turn3, "hybrid")
+    _, _, transformed_2, _ = _build_compressed_messages(turn2, "hybrid")
+    _, _, transformed_3, _ = _build_compressed_messages(turn3, "hybrid")
 
     # turn2's OWN compressed history (as sent for that turn) covers only the
     # first requirement — confirm turn3's compressed history for the SAME
