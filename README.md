@@ -6,7 +6,7 @@ In a multi-turn coding session, most of your context window is old generated cod
 
 ![ShapeShifter live dashboard — tokens before/after on a real coding session](docs/demo.gif)
 
-> **How is this different from LLMLingua?** LLMLingua drops low-value *tokens* using an ML model — lossy and opaque. ShapeShifter is structural and predictable: it removes whole *assistant-generated code blocks* from history and never touches your messages. No extra model, no lossy token soup, no config.
+> **How is this different from others LLM Compression Technologies like Headroom?** Others drops low-value *tokens* using an ML model — lossy and opaque. ShapeShifter is structural and predictable: it removes whole *assistant-generated code blocks* from history and never touches your messages. No extra model, no lossy token soup, no config.
 
 **In the benchmarks below, all three coding modes score 10/10 on the same automated checks as uncompressed `raw` — while sending 4–18% of the tokens.**
 
