@@ -6,7 +6,7 @@
 
 In a multi-turn coding session, most of your context window is old generated code — earlier drafts of files you've since revised. The model doesn't need turn 1's draft once turn 3 has superseded it, but it does need the *current* version to make a precise edit or fix a bug. ShapeShifter sits between your client (Cline, Continue, Aider, Open WebUI, curl, your own code) and any OpenAI-compatible API. It strips superseded drafts out of the history, keeps the **latest version of every file** plus every one of your instructions **verbatim**, and forwards a payload that's a fraction of the size. Standard API in, standard API out — nothing changes on either end.
 
-![ShapeShifter live dashboard — tokens before/after on a real coding session](docs/demo.gif)
+![ShapeShifter live dashboard — tokens before/after on a real coding session](dashboard.png)
 
 > **How is this different from others LLM Compression Technologies like Headroom?** Others drops low-value *tokens* using an ML model — lossy and opaque. ShapeShifter is structural and predictable: it removes only *superseded* assistant-generated code blocks from history — keeping the current file intact — and never touches your messages. No extra model, no lossy token soup, no config.
 
