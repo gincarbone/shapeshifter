@@ -64,11 +64,13 @@ def detect_contract_type(messages: list[dict]) -> str:
     all_text = " ".join(
         m.get("content", "") for m in messages if isinstance(m.get("content"), str)
     ).lower()
+    if any(k in all_text for k in ("generate", "create", "build", "implement", "write", "make")):
+        return "generation"
     if any(k in all_text for k in ("diff", "patch", "bug", "error", "fix", "debug", "exception", "traceback")):
         return "code"
     if any(k in all_text for k in ("compare", "comparison", "table", "difference")):
         return "comparison"
-    if any(k in all_text for k in ("email", "letter", "message", "text", "write")):
+    if any(k in all_text for k in ("email", "letter", "message")):
         return "email_text"
     if any(k in all_text for k in ("analysis", "cause", "root cause", "performance")):
         return "analysis"

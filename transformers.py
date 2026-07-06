@@ -498,12 +498,18 @@ def _format_artifacts_block(artifacts: dict[str, str], current_text: str = "") -
     compression opportunity. Collapsed entries always say so explicitly and
     invite the model to ask again, rather than silently going quiet about a
     file it already knows exists.
+
+    When artifacts are present the block also appends PATCH_FORMAT
+    instructions so the model knows to return only the changed regions
+    instead of regenerating the complete file. This activates automatically
+    from turn 2 onward (the first turn has no prior artifacts and takes the
+    standard full-file generation path).
     """
     if not artifacts:
         return []
     lines = ["", "current_artifacts (latest version of each file touched so far — "
-                  "edit these directly for fixes/changes, do not regenerate from scratch; "
-                  "collapsed entries are unchanged, ask to see one again if you need its content):"]
+                  "use PATCH_FORMAT below for changes; collapsed entries are unchanged, "
+                  "ask to see one again if you need its content):"]
     only_one = len(artifacts) == 1
     current_lower = current_text.lower()
     for key, code in artifacts.items():
@@ -521,6 +527,11 @@ def _format_artifacts_block(artifacts: dict[str, str], current_text: str = "") -
             lines += [f"  --- {label} ---", code]
         else:
             lines.append(stub)
+
+    # Patch instructions — appended whenever we have at least one prior artifact
+    # so the model knows to respond with targeted edits rather than a full file.
+    from patch_engine import PATCH_FORMAT_INSTRUCTIONS
+    lines += ["", PATCH_FORMAT_INSTRUCTIONS]
     return lines
 
 
@@ -579,10 +590,16 @@ def transform_yaml(context: str, current_text: str = "") -> str:
     if _is_coding_session(context):
         reqs = _extract_user_requirements(context)
         artifacts = _extract_latest_artifacts_collapsed(context)
+        editing = bool(artifacts)
+        constraint = (
+            "Use PATCH_FORMAT below. Do NOT regenerate the complete file."
+            if editing else
+            "Return COMPLETE file. All requirements must be present."
+        )
         data: dict = {
             "context_mode": "yaml",
             "cumulative_requirements": reqs,
-            "constraint": "Return COMPLETE file. All requirements must be present.",
+            "constraint": constraint,
         }
         out = "context_mode: yaml\n\n" + yaml.dump(data, default_flow_style=False, allow_unicode=True).strip()
         # Appended as plain text rather than YAML scalars — code blocks contain
@@ -660,11 +677,19 @@ def transform_hybrid(context: str, current_text: str = "") -> str:
     if _is_coding_session(context):
         reqs = _extract_user_requirements(context)
         artifacts = _extract_latest_artifacts_collapsed(context)
+        # Patch mode activates when there is at least one prior artifact;
+        # first-turn generation (no artifacts yet) always returns the full file.
+        editing = bool(artifacts)
+        constraint = (
+            "use PATCH_FORMAT below — do NOT regenerate the complete file"
+            if editing else
+            "return COMPLETE file, all requirements must be present"
+        )
         parts = [
             "context_mode: hybrid",
             "",
-            "task: generation",
-            "  constraint: return COMPLETE file, all requirements must be present",
+            f"task: {'editing' if editing else 'generation'}",
+            f"  constraint: {constraint}",
             "",
             "cumulative_requirements:",
         ]
@@ -771,6 +796,7 @@ def transform_incremental(context: str, current_text: str = "") -> str:
         return f"REQUIREMENT:\n{context[:600]}\n\nReturn complete working code."
 
     artifacts = _extract_latest_artifacts_collapsed(context)
+    editing = bool(artifacts)
 
     lines = [
         "CODING_SESSION: incremental",
@@ -782,10 +808,11 @@ def transform_incremental(context: str, current_text: str = "") -> str:
         lines.append(f"\n[{i}] {req}")
 
     lines += _format_artifacts_block(artifacts, current_text)
-    lines += [
-        "",
-        "CONSTRAINT: Return the COMPLETE updated file. No truncation. No placeholders.",
-    ]
+    if not editing:
+        lines += [
+            "",
+            "CONSTRAINT: Return the COMPLETE new file. No truncation. No placeholders.",
+        ]
     return "\n".join(lines)
 
 

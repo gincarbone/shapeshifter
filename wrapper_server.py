@@ -22,6 +22,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from llm_client import call_upstream, stream_upstream
 from mode_selector import choose_mode
 from output_contracts import build_system_prompt, detect_contract_type
+from patch_engine import (
+    apply_patch_ops, is_patch_response, parse_patch_response,
+    reconstruct_full_file_response, resolve_target_artifact, strip_code_fence,
+)
 from token_counter import compression_stats, count_tokens
 from transformers import VALID_MODES, apply_transform, _extract_retrievable_pieces
 
@@ -58,11 +62,13 @@ _start_time = time.monotonic()
 _start_wall  = datetime.now(timezone.utc)
 
 _stats: dict = {
-    "total_requests":    0,
-    "total_tokens_before": 0,
-    "total_tokens_after":  0,
-    "total_tokens_saved":  0,
-    "by_mode": {m: {"count": 0, "tok_before": 0, "tok_after": 0, "tok_saved": 0}
+    "total_requests":           0,
+    "total_tokens_before":      0,
+    "total_tokens_after":       0,
+    "total_tokens_saved":       0,
+    "total_output_tokens_saved": 0,
+    "by_mode": {m: {"count": 0, "tok_before": 0, "tok_after": 0,
+                    "tok_saved": 0, "out_tok_saved": 0}
                 for m in VALID_MODES},
 }
 _recent: deque[dict] = deque(maxlen=50)
@@ -220,27 +226,36 @@ def _persist_env(cfg: dict) -> None:
     _ENV_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
-def _record_stats(mode: str, s: dict, latency_ms: float, request_id: str = "", model: str = "") -> None:
-    _stats["total_requests"]      += 1
-    _stats["total_tokens_before"] += s["tokens_before"]
-    _stats["total_tokens_after"]  += s["tokens_after"]
-    _stats["total_tokens_saved"]  += s["tokens_saved"]
-    bm = _stats["by_mode"].setdefault(mode, {"count": 0, "tok_before": 0, "tok_after": 0, "tok_saved": 0})
-    bm["count"]      += 1
-    bm["tok_before"] += s["tokens_before"]
-    bm["tok_after"]  += s["tokens_after"]
-    bm["tok_saved"]  += s["tokens_saved"]
+def _record_stats(
+    mode: str, s: dict, latency_ms: float,
+    request_id: str = "", model: str = "", output_tokens_saved: int = 0,
+) -> None:
+    _stats["total_requests"]            += 1
+    _stats["total_tokens_before"]       += s["tokens_before"]
+    _stats["total_tokens_after"]        += s["tokens_after"]
+    _stats["total_tokens_saved"]        += s["tokens_saved"]
+    _stats["total_output_tokens_saved"] += output_tokens_saved
+    bm = _stats["by_mode"].setdefault(
+        mode,
+        {"count": 0, "tok_before": 0, "tok_after": 0, "tok_saved": 0, "out_tok_saved": 0},
+    )
+    bm["count"]        += 1
+    bm["tok_before"]   += s["tokens_before"]
+    bm["tok_after"]    += s["tokens_after"]
+    bm["tok_saved"]    += s["tokens_saved"]
+    bm["out_tok_saved"] += output_tokens_saved
 
     entry = {
-        "ts":            datetime.now(timezone.utc).strftime("%H:%M:%S"),
-        "request_id":    request_id,
-        "mode":          mode,
-        "model":         model,
-        "tok_before":    s["tokens_before"],
-        "tok_after":     s["tokens_after"],
-        "tok_saved":     s["tokens_saved"],
-        "reduction_pct": s["reduction_pct"],
-        "latency_ms":    round(latency_ms, 0),
+        "ts":                 datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "request_id":         request_id,
+        "mode":               mode,
+        "model":              model,
+        "tok_before":         s["tokens_before"],
+        "tok_after":          s["tokens_after"],
+        "tok_saved":          s["tokens_saved"],
+        "reduction_pct":      s["reduction_pct"],
+        "latency_ms":         round(latency_ms, 0),
+        "out_tok_saved":      output_tokens_saved,
     }
     _recent.appendleft(entry)
 
@@ -276,15 +291,16 @@ def _build_summary() -> dict:
         dollars_saved = round(_stats["total_tokens_saved"] / 1_000_000 * _model_input_cost_per_1m, 6)
 
     return {
-        "total_requests":       _stats["total_requests"],
-        "total_tokens_saved":   _stats["total_tokens_saved"],
-        "total_tokens_before":  _stats["total_tokens_before"],
-        "avg_ratio":            round(avg_ratio, 3),
-        "avg_reduction_pct":    round((1 - avg_ratio) * 100, 1),
-        "uptime_s":             uptime_s,
-        "by_mode":              by_mode_out,
-        "dollars_saved":        dollars_saved,
-        "model_input_cost_per_1m": _model_input_cost_per_1m,
+        "total_requests":            _stats["total_requests"],
+        "total_tokens_saved":        _stats["total_tokens_saved"],
+        "total_tokens_before":       _stats["total_tokens_before"],
+        "total_output_tokens_saved": _stats["total_output_tokens_saved"],
+        "avg_ratio":                 round(avg_ratio, 3),
+        "avg_reduction_pct":         round((1 - avg_ratio) * 100, 1),
+        "uptime_s":                  uptime_s,
+        "by_mode":                   by_mode_out,
+        "dollars_saved":             dollars_saved,
+        "model_input_cost_per_1m":   _model_input_cost_per_1m,
     }
 
 # ---------------------------------------------------------------------------
@@ -529,6 +545,73 @@ def _build_compressed_messages(
     # model could never usefully call.
     retrieval_map = _extract_retrievable_pieces(raw_ctx) if history and mode in ("hybrid", "yaml", "incremental") else {}
     return new_messages, full_raw, transformed_ctx, retrieval_map
+
+# ---------------------------------------------------------------------------
+# Output patch processing (Option A — reconstruct full file for client)
+# ---------------------------------------------------------------------------
+
+def _build_raw_artifact_store(retrieval_map: dict[str, str]) -> dict[str, str]:
+    """Build a store of {artifact_key: raw_content} from the retrieval map.
+
+    `retrieval_map` values are fenced code blocks (```lang\\n...\\n```).
+    Patch application operates on the raw text inside the fences, so we strip
+    them here once and reuse the result for both resolution and application.
+    Only whole-file entries are included (per-function sub-keys like
+    "calc.py#divide" are excluded — patching targets full files).
+    """
+    store: dict[str, str] = {}
+    for key, value in retrieval_map.items():
+        if "#" not in key:   # skip per-function sub-keys
+            raw, _ = strip_code_fence(value)
+            store[key] = raw
+    return store
+
+
+def _process_patch_response(
+    output_text: str, retrieval_map: dict[str, str]
+) -> tuple[str, int, int, int]:
+    """Detect, apply, and reconstruct a patch response into a full file.
+
+    Returns (final_output_text, output_tokens_saved, patches_applied, patches_failed).
+    If the response is not a patch, returns the original text with zeros.
+
+    Steps:
+    1. Quick check: does the response contain any patch markers?
+    2. Strip fences from artifacts in retrieval_map to get raw content.
+    3. Resolve which artifact is the target.
+    4. Parse + apply all patch ops in order.
+    5. Reconstruct a full-file response the client can use directly.
+    6. Compute output token savings: (full file size) - (patch text size).
+    """
+    if not retrieval_map or not is_patch_response(output_text):
+        return output_text, 0, 0, 0
+
+    raw_store = _build_raw_artifact_store(retrieval_map)
+    target_key = resolve_target_artifact(output_text, raw_store)
+    if not target_key:
+        return output_text, 0, 0, 0
+
+    artifact_raw = raw_store[target_key]
+    ops = parse_patch_response(output_text)
+    if not ops:
+        return output_text, 0, 0, 0
+
+    patched_text, ok, failed = apply_patch_ops(artifact_raw, ops)
+
+    # Tokens: what the model actually produced vs what a full file would cost
+    patch_tokens    = count_tokens(output_text)
+    fullfile_tokens = count_tokens(artifact_raw)
+    saved = max(0, fullfile_tokens - patch_tokens)
+
+    reconstructed = reconstruct_full_file_response(
+        model_prose=output_text,
+        patched_text=patched_text,
+        artifact_key=target_key,
+        patches_applied=ok,
+        patches_failed=failed,
+    )
+    return reconstructed, saved, ok, failed
+
 
 # ---------------------------------------------------------------------------
 # Routes — API
@@ -986,14 +1069,19 @@ async def _resolve_with_retrieval(
     return resp, total_latency, _MAX_RETRIEVAL_ROUNDS
 
 
-def _finalize_stats(mode: str, stats: dict, latency_ms: float, request_id: str,
-                     model: str, output_text: str, retrieval_rounds: int = 0) -> dict:
+def _finalize_stats(
+    mode: str, stats: dict, latency_ms: float, request_id: str,
+    model: str, output_text: str,
+    retrieval_rounds: int = 0, output_tokens_saved: int = 0,
+    patches_applied: int = 0,
+) -> dict:
     """Record stats/logs for a completed request (streamed or not) and return
     the `_shapeshifter` metrics block to attach to the response.
 
-    `retrieval_rounds` (Feature 6) is reported honestly rather than hidden:
-    if the model called the retrieval tool, extra round-trips were spent on
-    this request, and the dashboard/logs should show that real cost.
+    `retrieval_rounds` (Feature 6) is reported honestly rather than hidden.
+    `output_tokens_saved` is the delta between the full-file size the model
+    would have had to produce and the actual patch size — 0 for requests
+    where no patch was applied or patch mode is not active.
     """
     output_tokens = count_tokens(output_text)
     if LOG_RESPONSES:
@@ -1001,27 +1089,43 @@ def _finalize_stats(mode: str, stats: dict, latency_ms: float, request_id: str,
             "timestamp": datetime.utcnow().isoformat(),
             "request_id": request_id, "mode": mode,
             "estimated_output_tokens": output_tokens,
+            "output_tokens_saved": output_tokens_saved,
+            "patches_applied": patches_applied,
             "latency_ms": round(latency_ms, 1), "status": "success",
             "compression_ratio": stats["compression_ratio"],
             "reduction_pct": stats["reduction_pct"],
             "retrieval_rounds": retrieval_rounds,
         })
-    _record_stats(mode, stats, latency_ms, request_id=request_id, model=model)
+    _record_stats(mode, stats, latency_ms,
+                  request_id=request_id, model=model,
+                  output_tokens_saved=output_tokens_saved)
     result = {"request_id": request_id, "mode": mode, **stats, "latency_ms": round(latency_ms, 1)}
     if retrieval_rounds:
         result["retrieval_rounds"] = retrieval_rounds
+    if output_tokens_saved:
+        result["output_tokens_saved"] = output_tokens_saved
+        result["patches_applied"] = patches_applied
     return result
 
 
 async def _relay_stream(
     agen: AsyncGenerator[dict, None], first_chunk: dict, t0: float,
     mode: str, stats: dict, request_id: str, model: str,
+    retrieval_map: dict[str, str] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Forward upstream SSE chunks to the client as they arrive — no
     buffering of the full response — while accumulating output text so
     stats can be recorded once the stream actually ends. `_shapeshifter`
     metrics are attached to the final chunk, mirroring how they're attached
-    to the full response body in the non-streaming path."""
+    to the full response body in the non-streaming path.
+
+    Streaming patch note: chunks are forwarded as-is (no mid-stream
+    reconstruction). After the stream ends, if the accumulated output
+    contains patch markers, savings are measured and recorded in stats so
+    the dashboard reflects the benefit — but the client already received the
+    raw patch text, not a reconstructed file. Full Option-A reconstruction
+    is only available for non-streaming requests.
+    """
     output_text_parts: list[str] = []
 
     def _accumulate(chunk: dict) -> None:
@@ -1041,8 +1145,17 @@ async def _relay_stream(
             _accumulate(pending)
     finally:
         latency_ms = (time.monotonic() - t0) * 1000
+        output_text = "".join(output_text_parts)
+        # Stats-only patch tracking for streaming: measure savings without
+        # reconstructing the response (client already received the chunks).
+        output_tokens_saved = patches_applied = 0
+        if retrieval_map and output_text and is_patch_response(output_text):
+            _, output_tokens_saved, patches_applied, _ = _process_patch_response(
+                output_text, retrieval_map,
+            )
         pending["_shapeshifter"] = _finalize_stats(
-            mode, stats, latency_ms, request_id, model, "".join(output_text_parts),
+            mode, stats, latency_ms, request_id, model, output_text,
+            output_tokens_saved=output_tokens_saved, patches_applied=patches_applied,
         )
         yield f"data: {json.dumps(pending)}\n\n"
         yield "data: [DONE]\n\n"
@@ -1149,7 +1262,8 @@ async def chat_completions(request: Request):
                 status_code=502,
             )
         return StreamingResponse(
-            _relay_stream(agen, first_chunk, t0, mode, stats, request_id, model),
+            _relay_stream(agen, first_chunk, t0, mode, stats, request_id, model,
+                          retrieval_map=retrieval_map),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1181,8 +1295,24 @@ async def chat_completions(request: Request):
     except (KeyError, IndexError, TypeError):
         pass
 
+    # Patch processing (non-streaming only — Option A: apply patches and
+    # send the reconstructed full file to the client transparently).
+    # Patch mode is only active for coding-session modes that have prior artifacts;
+    # for all other modes retrieval_map is empty and this is a no-op.
+    output_tokens_saved = patches_applied = 0
+    if retrieval_map and output_text:
+        output_text, output_tokens_saved, patches_applied, _ = _process_patch_response(
+            output_text, retrieval_map,
+        )
+        if patches_applied:
+            try:
+                upstream_response["choices"][0]["message"]["content"] = output_text
+            except (KeyError, IndexError, TypeError):
+                pass
+
     upstream_response["_shapeshifter"] = _finalize_stats(
-        mode, stats, latency_ms, request_id, model, output_text, retrieval_rounds,
+        mode, stats, latency_ms, request_id, model, output_text,
+        retrieval_rounds, output_tokens_saved, patches_applied,
     )
     return JSONResponse(upstream_response)
 
@@ -1512,6 +1642,11 @@ tr:hover td{background:rgba(124,106,247,.05)}
       <div class="card-label">Tokens Saved</div>
       <div class="card-value green" id="c-saved">0</div>
       <div class="card-sub">input tokens not sent</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Output Saved</div>
+      <div class="card-value green" id="c-out-saved">0</div>
+      <div class="card-sub">output tokens via patches</div>
     </div>
     <div class="card">
       <div class="card-label">Avg Reduction</div>
@@ -1920,10 +2055,11 @@ function setConn(ok) {
   dot.className='conn-dot'+(ok?' ok':''); lbl.textContent=ok?'live':'reconnecting…';
 }
 function updateCards(s) {
-  document.getElementById('c-reqs').textContent  = s.total_requests;
-  document.getElementById('c-saved').textContent = s.total_tokens_saved.toLocaleString();
-  document.getElementById('c-ratio').textContent = s.total_requests ? s.avg_ratio.toFixed(3) : '\\u2014';
-  document.getElementById('c-reduc').textContent = s.total_requests ? s.avg_reduction_pct.toFixed(1)+'%' : '\\u2014';
+  document.getElementById('c-reqs').textContent     = s.total_requests;
+  document.getElementById('c-saved').textContent    = s.total_tokens_saved.toLocaleString();
+  document.getElementById('c-out-saved').textContent = (s.total_output_tokens_saved || 0).toLocaleString();
+  document.getElementById('c-ratio').textContent    = s.total_requests ? s.avg_ratio.toFixed(3) : '\\u2014';
+  document.getElementById('c-reduc').textContent    = s.total_requests ? s.avg_reduction_pct.toFixed(1)+'%' : '\\u2014';
   _uptime = s.uptime_s;
   // dollars saved card
   const dEl  = document.getElementById('c-dollars');

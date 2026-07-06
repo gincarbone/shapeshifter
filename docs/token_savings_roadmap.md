@@ -6,43 +6,350 @@ top of its section — update it as work progresses.
 
 ## Status at a glance / where to resume
 
-**Done, tested, verified end-to-end against real OpenRouter:** Features 1–8,
-all of them. All merged into the default pipeline. 93/93 tests pass
-(`pytest -q` from repo root). All 3 benchmark scenarios (HTML, FastAPI,
-edit_debug) were re-run after Features 7 and 8 landed, and README.md's
-Benchmark Results / Cost sections now reflect those numbers. **Confirmed:
-Feature 7 had zero measurable impact** on any of the 3 scenarios, as
-expected — none of them are agentic/tool-call-heavy sessions, so its code
-path never triggers. **Feature 8's impact is confirmed negligible**: HTML
-reduction moved from 52.5–54.0% to 53.3–53.4%, FastAPI from 59.6–61.9% to
-59.6–61.0%, edit_debug from 43.5–45.5% to 41.1–45.3% — all within normal
-run-to-run model stochasticity for these scenarios, not a measurable step
-change. Neither feature needs a dedicated re-run going forward. Feature 6
-doesn't change compression ratios at all — it's a correctness/quality
-mechanism for edit turns that need collapsed content back, not a
-token-savings one.
+**Input token reduction — Features 1–8: DONE**, tested, verified end-to-end
+against real OpenRouter. 93/93 tests pass (`pytest -q` from repo root). All 3
+benchmark scenarios (HTML, FastAPI, edit_debug) were re-run after Features 7
+and 8 landed, and README.md's Benchmark Results / Cost sections now reflect
+those numbers.
 
-**Nothing in this file is open right now.** The only explicitly-deferred
-work is noted under Feature 6's "Left for a future iteration": extending
-the retrieval tool to agentic requests, to streaming requests, and building
-it a dedicated repeatable benchmark scenario (today it has real end-to-end
-proof of correctness — see Feature 6's section — but not an automated
-benchmark the way retention has Scenario 3). If picking that up, start
-there rather than re-deriving the design from scratch.
+**Output token reduction — Features O1–O4: DONE**, implemented and tested
+offline. See the Output Token Reduction section below for design and
+implementation details. No benchmark re-run yet — a dedicated scenario is
+needed (see Feature O5). The dashboard now tracks output savings in a new
+"Output Saved" card alongside the existing "Tokens Saved" card.
+
+**Open work:**
+- Feature 6 deferred items: retrieval tool for agentic and streaming requests,
+  dedicated benchmark scenario.
+- Feature O5: benchmark scenario for output patch mode (see below).
+- Feature O6: streaming Option-A reconstruction (currently streaming passes
+  patch text through to client; stats are tracked but the client sees raw
+  patches, not the reconstructed file).
 
 If you're resuming and unsure where things stand, run `pytest -q` and check
-`git diff --stat transformers.py wrapper_server.py` against the last commit
-— everything described as DONE below should already be reflected there.
+`git diff --stat transformers.py wrapper_server.py patch_engine.py` against
+the last commit — everything described as DONE below should already be
+reflected there.
 
-Context: this follows the selective-retention work (transformers.py's
-`_extract_latest_artifacts`, keeps latest version per file for USER+ASSISTANT
-blocks) and the tool-read dedup in wrapper_server.py
-(`_dedupe_repeated_tool_file_reads`, currently exact-match-only). See
-README.md's "Benchmark Results" and "Cost, not just percentage" sections for
-the measured baseline this roadmap builds on (38–62% of raw tokens sent,
-depending on scenario).
+Context: input-side work follows the selective-retention design
+(`_extract_latest_artifacts`, `_dedupe_repeated_tool_file_reads`). Output-side
+work lives in the new `patch_engine.py` module, with hooks in
+`transformers.py` (`_format_artifacts_block`) and `wrapper_server.py`
+(`_process_patch_response`). See README.md for the measured baseline
+(38–62% input reduction, depending on scenario).
 
 ---
+
+## Output Token Reduction
+
+The features below address the output side of the token budget. Features 1–8
+above reduced *input* tokens by compressing what the proxy sends to the model
+each turn. The model's *output* was untouched: for coding sessions it always
+regenerated the complete current file, paying the full output-token cost even
+when only a few lines changed. Output pricing on most providers equals or
+exceeds input pricing, so a 300-line file regenerated 8 times in a 10-turn
+session carries a real cost that input compression doesn't reach.
+
+The approach taken here is structural and predictable — the same design
+philosophy as Features 1–8. The proxy instructs the model to return only the
+*changed regions* of a file using an explicit patch format, applies those
+patches internally against the in-memory artifact (already tracked by
+`_extract_latest_artifacts`), and reconstructs a complete file before sending
+it to the client. The client sees exactly what it would have seen before — a
+full file in a code fence — with no protocol change. Output token savings are
+measured, logged, and shown in the dashboard.
+
+---
+
+## Feature O1 — Patch format definition and prompt injection
+
+**Status: DONE.** Implemented in `patch_engine.py` (constant
+`PATCH_FORMAT_INSTRUCTIONS`) and `transformers.py` (`_format_artifacts_block`).
+
+### What
+Define a structured, LLM-reliable patch format and inject it into the prompt
+for every editing turn. Four formats at increasing granularity:
+
+1. **SEARCH/REPLACE** (primary — any granularity, line-to-section):
+   ```
+   <<<<<<< SEARCH
+   [exact lines to replace, verbatim from the file content]
+   =======
+   [replacement lines]
+   >>>>>>> REPLACE
+   ```
+2. **REPLACE_FUNCTION / REPLACE_METHOD** (whole function rewrite):
+   ```
+   REPLACE_FUNCTION: name
+   ```lang
+   [complete new body including the def/signature line]
+   ```
+   ```
+3. **REPLACE_CLASS** (whole class rewrite) — same shape as REPLACE_FUNCTION.
+4. **INSERT_AFTER** (new code after a named entity):
+   ```
+   INSERT_AFTER: existing_name
+   ```lang
+   [new block]
+   ```
+   ```
+5. **EDIT_LINE** (single-line replacement):
+   ```
+   EDIT_LINE: N
+   new content for that line
+   ```
+
+### Why SEARCH/REPLACE and not unified diff
+Unified diff (`@@` markers with line numbers) is the natural format but models
+produce it unreliably — line numbers drift after multiple edits and the model
+hallucinates context lines. SEARCH/REPLACE doesn't depend on line numbers: the
+engine finds the exact text in the artifact and replaces it. Aider adopted this
+format for the same reason after extensive real-world testing. Named-entity
+formats (REPLACE_FUNCTION, REPLACE_CLASS) are an additional layer that reuses
+the block-splitting infrastructure already in `_split_definition_blocks` —
+they're more reliable than SEARCH/REPLACE for whole-function rewrites because
+the model doesn't need to reproduce the exact first and last line of the block.
+
+### Where
+- `patch_engine.py`: `PATCH_FORMAT_INSTRUCTIONS` constant — the verbatim text
+  injected into the prompt, including format examples for all five op types.
+- `transformers.py`, `_format_artifacts_block`: appends
+  `PATCH_FORMAT_INSTRUCTIONS` at the end of the artifacts block whenever at
+  least one prior artifact exists (i.e., from turn 2 onward). Also updates the
+  header text from "edit these directly for fixes/changes" to "use PATCH_FORMAT
+  below for changes".
+
+### Activation condition
+Patch instructions are injected if and only if `_format_artifacts_block` is
+called with a non-empty `artifacts` dict — which only happens inside the
+`_is_coding_session` branch of `transform_hybrid`/`transform_yaml`/
+`transform_incremental`, which only fires when a prior `[ASSISTANT]` turn
+already contains generated code. Turn 1 (no prior artifact) never sees the
+patch instructions and is not asked to produce a patch. This activation is
+per-turn and evaluated fresh each request — not frozen to the first turn like
+the output contract type (Feature 4).
+
+---
+
+## Feature O2 — Constraint switching: generation vs editing
+
+**Status: DONE.** Implemented in `transform_hybrid`, `transform_yaml`,
+`transform_incremental` (transformers.py) and `detect_contract_type`
+(output_contracts.py).
+
+### What
+The three coding-session transforms previously always emitted a constraint
+saying "return COMPLETE file". This directly contradicted the patch
+instructions injected by Feature O1. The constraint is now conditional:
+
+- **No prior artifact** (first generation turn): constraint stays "return
+  COMPLETE file, all requirements must be present". `task` label is
+  `generation`.
+- **Prior artifact exists** (edit/debug turn): constraint becomes "use
+  PATCH_FORMAT below — do NOT regenerate the complete file". `task` label is
+  `editing`.
+
+### Where
+- `transform_hybrid`: `editing = bool(artifacts)`, constraint and task label
+  switched conditionally.
+- `transform_yaml`: constraint field in the YAML packet switched.
+- `transform_incremental`: trailing `CONSTRAINT: Return the COMPLETE new file`
+  line only appended when `not editing`.
+- `output_contracts.py`, `detect_contract_type`: added `generation` as the
+  first branch (keywords: `generate`, `create`, `build`, `implement`, `write`,
+  `make`) so the first user turn in a coding session correctly receives the
+  `generation` contract ("Return the COMPLETE, working file") rather than
+  falling through to `generic`. Contract type is still frozen to the first
+  turn (Feature 4 invariant preserved).
+
+### Safety
+If the model ignores the patch instruction and returns a full file anyway, the
+proxy detects this (`is_patch_response` returns False) and passes the response
+through unchanged — no savings, but no breakage. The client sees a normal full
+file.
+
+---
+
+## Feature O3 — Patch parsing and application engine
+
+**Status: DONE.** Implemented in `patch_engine.py`.
+
+### What
+A self-contained, modular engine that:
+1. Detects whether a model response contains any patch markers
+   (`is_patch_response`).
+2. Parses all patch ops from the response in document order
+   (`parse_patch_response`) — returns a typed list of `PatchOp` objects.
+3. Resolves which in-memory artifact the patches target
+   (`resolve_target_artifact`).
+4. Applies ops in order against the raw (unfenced) artifact text
+   (`apply_patch_ops`) — partial success is supported: applied ops accumulate,
+   failed ops leave their portion unchanged.
+5. Reconstructs a full-file response for the client
+   (`reconstruct_full_file_response`).
+
+### Target resolution (in confidence order)
+1. Filename mentioned explicitly in the response → match against store keys.
+2. Single artifact in the store → unambiguous.
+3. SEARCH text found verbatim in exactly one artifact → content-based match.
+Returns `None` if resolution fails; the response passes through unchanged.
+
+### Fuzzy matching fallback for SEARCH/REPLACE
+Exact match is tried first. If the search text isn't found verbatim (can
+happen when the model introduces trailing spaces or collapses a blank line),
+a normalized form is tried: trailing whitespace stripped per line, runs of
+consecutive blank lines collapsed to one. Leading (indentation) whitespace is
+never normalized — a real reindentation must still be treated as a changed
+region, not a noise difference. This matches the same normalization already
+used in `_normalize_for_comparison` (Feature 8), applied here to the search
+step rather than the equality check.
+
+### REPLACE_FUNCTION / REPLACE_CLASS
+Both delegate to `_apply_named_block`, which reuses `_split_definition_blocks`
+and `_clean_declaration_name` from `transformers.py` — the same block-splitter
+that drives touched-region collapsing (Feature 3). The target block is found
+by name, its exact text is located in the artifact, and the replacement is
+spliced in. Covers Python, JS/TS, Rust, Go, Kotlin/Swift, and the C family
+(same language set as Feature 3).
+
+### Response reconstruction (Option A)
+`reconstruct_full_file_response` keeps any explanatory prose the model wrote
+before the first patch marker, appends a `[ShapeShifter: N patches applied]`
+status line, and wraps the complete patched file in a code fence with the
+correct language hint (derived from the artifact key's file extension or
+fence language). The client (Cline, Continue, etc.) sees a normal full-file
+response — transparent, no protocol change.
+
+### Where
+- `patch_engine.py` (new file): all parsing, application, and reconstruction
+  logic. No LLM calls. Pure deterministic transforms.
+- `wrapper_server.py`, `_build_raw_artifact_store`: strips code fences from
+  `retrieval_map` entries (which contain fenced content) to build the raw-text
+  store that the patch engine operates on. Excludes per-function sub-keys
+  (e.g. `"calc.py#divide"`) — patching targets whole files only.
+- `wrapper_server.py`, `_process_patch_response`: orchestrates the full
+  pipeline (detect → resolve → parse → apply → reconstruct → measure savings).
+
+---
+
+## Feature O4 — Output token savings tracking and dashboard card
+
+**Status: DONE.** Implemented in `wrapper_server.py`.
+
+### What
+Output token savings are measured, accumulated, and displayed — parallel to
+the existing input token savings infrastructure.
+
+**Savings definition:**
+```
+output_tokens_saved = max(0, count_tokens(full_artifact) - count_tokens(patch_response))
+```
+`full_artifact` is the raw content of the targeted artifact already in memory
+— what the model would have had to produce if it had regenerated the complete
+file. `patch_response` is the actual model output. The `max(0, ...)` guard
+ensures savings are never negative: for very short files where the patch
+overhead (format markers, prose) exceeds the file size, savings are reported
+as 0, not a debt.
+
+**Non-streaming (Option A — full reconstruction):** savings are computed after
+patch application, before the response is returned to the client. The
+reconstructed full-file content replaces the raw patch in
+`choices[0].message.content`.
+
+**Streaming (stats-only):** chunks are forwarded as-is (no buffering, no
+latency added). After the stream ends, the accumulated output text is checked
+for patch markers and savings are measured and recorded. The client already
+received the raw patch text — reconstruction is not retroactively applied. This
+is the only meaningful difference between streaming and non-streaming behavior
+for this feature. Full Option-A for streaming is deferred to Feature O6.
+
+### Where
+- `_stats`: added `total_output_tokens_saved` (global) and `out_tok_saved`
+  (per mode in `by_mode`).
+- `_record_stats`: new `output_tokens_saved: int = 0` parameter; accumulates
+  into both global and per-mode counters.
+- `_finalize_stats`: new `output_tokens_saved: int = 0` and
+  `patches_applied: int = 0` parameters; both included in the `_shapeshifter`
+  response block when non-zero.
+- `_build_summary`: `total_output_tokens_saved` included in the summary dict
+  returned by `/v1/stats/summary`.
+- `responses.jsonl`: `output_tokens_saved` and `patches_applied` fields added
+  to every logged response.
+- Dashboard: new **Output Saved** card (HTML + JS `updateCards`) shows
+  cumulative output tokens saved, positioned next to the existing
+  **Tokens Saved** (input) card.
+- `_relay_stream`: new optional `retrieval_map` parameter; post-stream patch
+  detection for stats accounting.
+
+---
+
+## Feature O5 — Benchmark scenario for output patch mode
+
+**Status: not started.**
+
+### What
+A dedicated multi-turn scenario that measures output token savings for patch
+mode, analogous to the way Scenario 3 (edit_debug) measures input savings for
+selective retention. Needed because the existing three scenarios are
+build-from-scratch (turn 1 generates the file; subsequent turns add features
+but the file is always newer than anything the model has seen) — they don't
+produce the edit/refactor turns that trigger patch mode.
+
+### Design
+The scenario should look like the edit_debug scenario but with more turns and
+a larger file, so that:
+- The output savings per turn are large enough to measure reliably.
+- Multiple different patch formats are exercised (SEARCH/REPLACE for small
+  edits, REPLACE_FUNCTION for whole-method rewrites, INSERT_AFTER for new
+  additions).
+- Automated checks verify that the reconstructed file is semantically correct
+  (same set of checks as edit_debug, adapted).
+
+A good starting point: extend `benchmarks/scenarios/edit_debug_session.json`
+with 4–6 additional turns that are purely edit/refactor (rename across the
+file, add a method that calls an existing one, change a method signature and
+update all callers). Measure both input and output savings, compare against
+`raw` baseline.
+
+### Key question to answer
+What fraction of output tokens does patch mode actually save in a realistic
+edit-heavy session? The 110-token saving measured in the offline test above
+used a ~30-line file with a single-method patch — a real session with a
+200-line file and 3–4 patches per turn should see much larger absolute savings.
+
+---
+
+## Feature O6 — Option-A reconstruction for streaming responses
+
+**Status: not started.**
+
+### What
+Currently, streaming requests forward chunks as they arrive and apply patch
+detection post-stream for stats only. The client receives the raw patch text
+rather than the reconstructed full file. This is the only meaningful gap
+between streaming and non-streaming behavior for patch mode.
+
+### Design options
+1. **Buffer-then-stream**: collect all chunks internally, apply patches,
+   stream the reconstructed file as a single large chunk followed by
+   `[DONE]`. Simple but removes the progressive-output benefit of streaming.
+2. **Detect-then-synthesize**: detect during streaming whether the response
+   is a patch (first patch marker arrives early), buffer from that point,
+   apply patches after the stream ends, stream the reconstructed file as
+   a new synthetic SSE stream. More complex, preserves progressive output
+   for the prose prefix before the first marker.
+3. **Hybrid**: stream the model's prose prefix as-is, then buffer the patch
+   body, apply, stream the reconstructed file. Requires detecting the
+   transition between prose and patch mid-stream.
+
+Option 1 is the safest starting point. The latency penalty is bounded by the
+time to receive the full patch (which is shorter than the full file would have
+been), so the client sees the file *at most* as late as it would have in
+non-patch mode.
+
+### Prerequisite
+A real patch-mode benchmark (Feature O5) that confirms patch mode is working
+correctly for non-streaming before adding the streaming complexity.
 
 ## Feature 1 — Generalize tool-read dedup from exact-match to latest-wins
 
