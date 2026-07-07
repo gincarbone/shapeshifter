@@ -29,6 +29,8 @@ from patch_engine import (
 from token_counter import compression_stats, count_tokens
 from transformers import VALID_MODES, apply_transform, _extract_retrievable_pieces
 
+from alfa1_routes import router as alfa1_router
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -308,6 +310,7 @@ def _build_summary() -> dict:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="ShapeShifter", version="0.2.0")
+app.include_router(alfa1_router, prefix="/alfa1")
 
 
 def _log(filename: str, record: dict) -> None:
@@ -2249,5 +2252,6 @@ updateModeTable({});
 if __name__ == "__main__":
     print(f"\n  ShapeShifter v0.2  —  http://{HOST}:{PORT}/v1")
     print(f"  Dashboard        —  http://{HOST}:{PORT}/dashboard")
+    print(f"  Alfa1            —  http://{HOST}:{PORT}/alfa1")
     print(f"  Mode: {CONTEXT_MODE} | Auto: {AUTO_MODE} | Upstream: {UPSTREAM_URL or '(not set)'}\n")
     uvicorn.run("wrapper_server:app", host=HOST, port=PORT, reload=False)

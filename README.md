@@ -239,6 +239,29 @@ Every API response includes an inline `_shapeshifter` field with per-request met
 
 ---
 
+## Alfa1 — built-in coding agent
+
+Alfa1 is a browser-based coding agent that ships with ShapeShifter, served at:
+
+**http://127.0.0.1:8787/alfa1**
+
+It's a 3-column IDE-style UI (file tree + token-savings cards, open-file code viewer, agent chat) that talks to a folder on your disk through ShapeShifter's own proxy — so every request it sends benefits from the same input-token compression and output-token patch savings as any other client, and both are visible live in the left column.
+
+### How it works
+
+- **Pick a folder** on first load (native OS folder dialog) — Alfa1 gets full read/write/execute permissions inside it.
+- **Chat with the agent** to build or modify code. It acts by producing plain text, not native OpenAI tool-calling — deliberately, since declaring a `tools` schema would make ShapeShifter's own `_is_agentic` detection treat the whole conversation as an opaque agentic passthrough and skip compression entirely. Instead:
+  - File writes: a backtick-wrapped path followed by a fenced code block (`` `app.py` ```python ... ``` ``). From the second edit onward, ShapeShifter injects `PATCH_FORMAT` instructions automatically and the model returns a SEARCH/REPLACE-style patch instead of the whole file — Alfa1 applies it directly against the real file on disk if the proxy's own reconstruction can't resolve it.
+  - Other actions use small text tags: `<alfa1:read_file>`, `<alfa1:write_file>` (via the convention above), `<alfa1:delete_file>`, `<alfa1:list_files>`, `<alfa1:search_files>`, `<alfa1:run_command>`.
+- **Live activity feed** (right column) shows reasoning, tool calls/results, and a status bar (animated while working, green on success, red on error) — with a **Cancel** button to force-stop a stuck turn (e.g. a command that blocks waiting on stdin).
+- **Session persistence**: the last-used folder and the full chat history are remembered per-workspace (`<folder>/.alfa1/history.json`), so a server restart or closed tab resumes right where you left off — no in-memory-only state to lose.
+
+### Safety notes
+
+Alfa1 has no command allowlist/blacklist — `run_command` executes anything, scoped only to the chosen folder as its working directory (not as a sandbox: the command itself can still reach anywhere the OS user can). This is intentional for a local, single-user dev tool where you've already granted full permissions to the folder you picked. Don't point it at a folder you wouldn't otherwise hand shell access to.
+
+---
+
 ## Benchmark Suite
 
 ShapeShifter includes a multi-turn coding benchmark that measures compression efficiency vs. output quality across all modes.
@@ -428,6 +451,12 @@ shapeshifter/
 ├── token_counter.py         # Token counting and compression stats
 ├── output_contracts.py      # System prompts per task type
 ├── mode_selector.py         # Auto mode selection heuristics
+├── patch_engine.py          # Output-side patch parsing/application (SEARCH/REPLACE etc.)
+├── alfa1_routes.py          # Alfa1 — FastAPI routes + in-memory/session state
+├── alfa1_agent.py           # Alfa1 — plain-text agentic loop (no native tool-calling)
+├── alfa1_tools.py           # Alfa1 — workspace-scoped file I/O, search, shell exec
+├── alfa1_ui.py              # Alfa1 — 3-column browser UI (HTML/CSS/JS)
+├── alfa1_config.py          # Alfa1 — loopback base URL helper
 ├── benchmark.py             # Single-turn compression benchmark
 ├── benchmark_coding.py      # Multi-turn coding quality benchmark
 ├── benchmarks/

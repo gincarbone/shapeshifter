@@ -16,3 +16,4 @@ dist/
 Thumbs.db
 
 .shapeshifter_keys.json
+.alfa1_last_workspace*.json
