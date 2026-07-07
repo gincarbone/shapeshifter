@@ -93,6 +93,24 @@ def save_history(conversation: list[dict]) -> None:
         pass
 
 
+def delete_history() -> bool:
+    """Remove the persisted history file for the current workspace entirely
+    (as opposed to save_history([]), which leaves an empty-array file in
+    place) — used by the "clear all stored sessions" UI action, a harder
+    wipe than the "new task" soft reset. Returns whether a file actually
+    existed to delete."""
+    if _workspace_root is None:
+        return False
+    f = _session_file()
+    if not f.exists():
+        return False
+    try:
+        f.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def load_history() -> list[dict] | None:
     """Previously saved conversation for the current workspace, or None if
     there isn't one (a brand-new workspace, or one never used with Alfa1)."""

@@ -83,6 +83,26 @@ def test_save_history_no_op_without_workspace():
     alfa1_tools.save_history([{"role": "user", "content": "hi"}])  # must not raise
 
 
+def test_delete_history_removes_the_file(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    alfa1_tools.save_history([{"role": "user", "content": "hi"}])
+    assert (tmp_path / ".alfa1" / "history.json").exists()
+
+    deleted = alfa1_tools.delete_history()
+    assert deleted is True
+    assert not (tmp_path / ".alfa1" / "history.json").exists()
+    assert alfa1_tools.load_history() is None
+
+
+def test_delete_history_false_when_nothing_to_delete(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    assert alfa1_tools.delete_history() is False
+
+
+def test_delete_history_false_without_workspace():
+    assert alfa1_tools.delete_history() is False
+
+
 @pytest.mark.parametrize("bad_path", [
     "../etc/passwd",
     "../../secret.txt",

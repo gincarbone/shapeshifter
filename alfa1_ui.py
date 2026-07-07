@@ -95,6 +95,10 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);fon
 #cancel-btn{background:transparent;border:1px solid var(--red);color:var(--red);border-radius:4px;
             padding:3px 8px;font-size:9px;cursor:pointer}
 #cancel-btn.hidden{display:none}
+.topbar-icon-btn{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:4px;
+                  padding:3px 7px;font-size:11px;cursor:pointer;line-height:1}
+.topbar-icon-btn:hover{border-color:var(--accent);color:var(--accent)}
+#clear-sessions-btn:hover{border-color:var(--red);color:var(--red)}
 .activity-dot{width:8px;height:8px;border-radius:50%;background:var(--border);flex-shrink:0}
 .activity-dot.working{background:var(--yellow);animation:alfa1-pulse 1s infinite}
 .activity-dot.ok{background:var(--green)}
@@ -477,6 +481,15 @@ function setStatus(status){
 async function cancelTurn(){
   await fetch('/alfa1/cancel', {method:'POST'});
 }
+async function startNewTask(){
+  await fetch('/alfa1/reset', {method:'POST'});
+  document.getElementById('chat-log').innerHTML = '';
+}
+async function clearAllSessions(){
+  if(!confirm('Permanently delete the stored chat history for this folder? This cannot be undone.')) return;
+  await fetch('/alfa1/history', {method:'DELETE'});
+  document.getElementById('chat-log').innerHTML = '';
+}
 async function sendMessage(){
   const input = document.getElementById('chat-input');
   const message = input.value.trim();
@@ -571,6 +584,8 @@ document.getElementById('pick-btn').onclick = pickFolder;
 document.getElementById('picker-box-btn').onclick = pickFolder;
 document.getElementById('chat-send').onclick = sendMessage;
 document.getElementById('cancel-btn').onclick = cancelTurn;
+document.getElementById('new-task-btn').onclick = startNewTask;
+document.getElementById('clear-sessions-btn').onclick = clearAllSessions;
 document.getElementById('chat-input').addEventListener('keydown', (e) => {
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendMessage(); }
 });
@@ -608,7 +623,13 @@ ALFA1_HTML = f"""\
   </div>
   <div class="resizer" id="resizer-2"></div>
   <div id="col3">
-    <div id="col3-topbar"><span class="title">Activity Status</span><button id="cancel-btn" class="hidden">Cancel</button><span class="activity-dot" id="activity-dot"></span></div>
+    <div id="col3-topbar">
+      <span class="title">Activity Status</span>
+      <button id="cancel-btn" class="hidden">Cancel</button>
+      <button id="new-task-btn" class="topbar-icon-btn" title="Start a new task (clears the current chat)">+ New Task</button>
+      <button id="clear-sessions-btn" class="topbar-icon-btn" title="Permanently delete the stored chat history for this folder">Clear Sessions</button>
+      <span class="activity-dot" id="activity-dot"></span>
+    </div>
     <div id="chat-log"></div>
     <div id="chat-input-wrap">
       <textarea id="chat-input" rows="3" placeholder="Ask Alfa1 to build something... (Enter to send, Shift+Enter for newline)"></textarea>

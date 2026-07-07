@@ -142,6 +142,9 @@ async def files_delete(path: str):
 
 @router.post("/reset")
 async def reset_conversation():
+    """"New task" reset: clears the current conversation and starts fresh,
+    but leaves an empty history.json in place (via save_history below) —
+    the next turn resumes normal persistence immediately."""
     global _turn_status
     await _cancel_current_task()
     _conversation.clear()
@@ -149,6 +152,20 @@ async def reset_conversation():
     alfa1_tools.save_history(_conversation)
     await _broadcast({"type": "snapshot", "conversation": _conversation, "status": _turn_status})
     return {"ok": True}
+
+
+@router.delete("/history")
+async def clear_all_sessions():
+    """"Clear all stored sessions": a harder wipe than /reset — removes the
+    persisted history.json file for the current workspace entirely, not
+    just the in-memory conversation."""
+    global _turn_status
+    await _cancel_current_task()
+    _conversation.clear()
+    _turn_status = "idle"
+    deleted = alfa1_tools.delete_history()
+    await _broadcast({"type": "snapshot", "conversation": _conversation, "status": _turn_status})
+    return {"ok": True, "deleted": deleted}
 
 
 @router.post("/cancel")

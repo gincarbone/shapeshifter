@@ -170,6 +170,35 @@ def test_chat_rejects_concurrent_turn(client, tmp_path):
     assert r.status_code == 400
 
 
+def test_reset_clears_conversation_and_persists_empty_history(client, tmp_path):
+    client.post("/alfa1/workspace", json={"path": str(tmp_path)})
+    alfa1_routes._conversation.append({"role": "user", "content": "hi"})
+
+    r = client.post("/alfa1/reset")
+    assert r.status_code == 200
+    assert alfa1_routes._conversation == []
+    assert (tmp_path / ".alfa1" / "history.json").read_text(encoding="utf-8") == "[]"
+
+
+def test_clear_all_sessions_deletes_the_history_file(client, tmp_path):
+    client.post("/alfa1/workspace", json={"path": str(tmp_path)})
+    alfa1_tools.save_history([{"role": "user", "content": "hi"}])
+    assert (tmp_path / ".alfa1" / "history.json").exists()
+
+    r = client.delete("/alfa1/history")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "deleted": True}
+    assert not (tmp_path / ".alfa1" / "history.json").exists()
+    assert alfa1_routes._conversation == []
+
+
+def test_clear_all_sessions_without_a_prior_history_file_is_still_ok(client, tmp_path):
+    client.post("/alfa1/workspace", json={"path": str(tmp_path)})
+    r = client.delete("/alfa1/history")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "deleted": False}
+
+
 def test_cancel_with_no_running_turn_is_a_no_op(client):
     r = client.post("/alfa1/cancel")
     assert r.status_code == 200
