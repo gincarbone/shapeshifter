@@ -8,6 +8,8 @@ test_alfa1_tools.py and test_alfa1_agent.py.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -22,6 +24,7 @@ def _reset_state(tmp_path_factory, monkeypatch):
     alfa1_routes._conversation.clear()
     alfa1_routes._turn_status = "idle"
     alfa1_routes._current_task = None
+    alfa1_routes._pending_queue.clear()
     # Redirect the last-workspace pointer so these tests never read/write
     # the real user's remembered workspace (see test_alfa1_tools.py's
     # equivalent fixture for the same reasoning).
@@ -34,6 +37,7 @@ def _reset_state(tmp_path_factory, monkeypatch):
     alfa1_routes._conversation.clear()
     alfa1_routes._turn_status = "idle"
     alfa1_routes._current_task = None
+    alfa1_routes._pending_queue.clear()
 
 
 @pytest.fixture
@@ -159,15 +163,59 @@ def test_chat_accepts_and_appends_user_message(client, tmp_path, monkeypatch):
     client.post("/alfa1/workspace", json={"path": str(tmp_path)})
     r = client.post("/alfa1/chat", json={"message": "hello agent"})
     assert r.status_code == 200
-    assert r.json() == {"accepted": True}
+    assert r.json() == {"accepted": True, "queued": False}
     assert alfa1_routes._conversation[-1] == {"role": "user", "content": "hello agent"}
 
 
-def test_chat_rejects_concurrent_turn(client, tmp_path):
+def test_chat_queues_instead_of_rejecting_when_a_turn_is_in_progress(client, tmp_path):
     client.post("/alfa1/workspace", json={"path": str(tmp_path)})
     alfa1_routes._turn_status = "working"
+
     r = client.post("/alfa1/chat", json={"message": "hi"})
-    assert r.status_code == 400
+    assert r.status_code == 200
+    assert r.json() == {"accepted": True, "queued": True, "position": 1}
+    assert alfa1_routes._pending_queue == [{"message": "hi", "model": None}]
+    # the queued message must NOT be appended to the live conversation yet —
+    # it's only added when its turn actually starts
+    assert alfa1_routes._conversation == []
+
+    r2 = client.post("/alfa1/chat", json={"message": "second"})
+    assert r2.json()["position"] == 2
+    assert len(alfa1_routes._pending_queue) == 2
+
+
+def test_drain_queue_starts_the_next_message_once_idle(monkeypatch, client, tmp_path):
+    client.post("/alfa1/workspace", json={"path": str(tmp_path)})
+
+    async def fake_run_agent_turn(conversation, model=None, on_event=None):
+        return conversation
+    monkeypatch.setattr(alfa1_routes, "run_agent_turn", fake_run_agent_turn)
+
+    alfa1_routes._pending_queue.append({"message": "queued message", "model": None})
+    asyncio.run(alfa1_routes._drain_queue())
+
+    assert alfa1_routes._pending_queue == []
+    assert alfa1_routes._conversation[-1] == {"role": "user", "content": "queued message"}
+
+
+def test_drain_queue_is_a_no_op_when_a_turn_is_already_working(client, tmp_path):
+    client.post("/alfa1/workspace", json={"path": str(tmp_path)})
+    alfa1_routes._pending_queue.append({"message": "queued message", "model": None})
+    alfa1_routes._turn_status = "working"
+
+    asyncio.run(alfa1_routes._drain_queue())
+
+    assert alfa1_routes._pending_queue == [{"message": "queued message", "model": None}]
+    assert alfa1_routes._conversation == []
+
+
+def test_reset_clears_the_pending_queue_too(client, tmp_path):
+    client.post("/alfa1/workspace", json={"path": str(tmp_path)})
+    alfa1_routes._pending_queue.append({"message": "stale", "model": None})
+
+    client.post("/alfa1/reset")
+
+    assert alfa1_routes._pending_queue == []
 
 
 def test_reset_clears_conversation_and_persists_empty_history(client, tmp_path):

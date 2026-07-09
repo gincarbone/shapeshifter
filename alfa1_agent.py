@@ -49,6 +49,7 @@ that similarly avoids `tools`/`tool_calls`:
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Awaitable, Callable
 
@@ -268,8 +269,29 @@ def _extract_file_writes(content: str) -> list[tuple[str, str]]:
 def _resolve_patch_target_path(content: str, marker_pos: int) -> str | None:
     """Best-effort filename for a raw (unresolved-by-the-proxy) patch
     response: the same header/comment conventions used for file writes,
-    searched in the text before the first patch marker, falling back to
-    "the only file in the workspace" when the workspace has exactly one."""
+    falling back to "the only file in the workspace" when the workspace has
+    exactly one.
+
+    Regression note: the patch marker sits INSIDE the fence (header ->
+    ```lang -> <<<<<<< SEARCH), one or more lines after the filename header.
+    Searching for the header immediately before marker_pos therefore always
+    misses it — the fence-open line sits between them, breaking
+    _FILENAME_HEADER's "must be immediately before end of string" anchor.
+    Observed in practice causing every apply_patch attempt in a session to
+    fail with "didn't clearly specify which file it targets", repeatedly,
+    even though the model correctly wrote `path.ext` before every attempt.
+    Look for the header right before the FENCE (like _extract_file_writes
+    does for normal writes), not right before the marker.
+    """
+    fence_start = content.rfind("```", 0, marker_pos)
+    if fence_start != -1:
+        m = _FILENAME_HEADER.search(content[:fence_start][-200:])
+        if m:
+            return m.group(1)
+        m = _FILENAME_COMMENT.search(content[fence_start:marker_pos][:200])
+        if m:
+            return m.group(1)
+
     preceding = content[:marker_pos]
     m = _FILENAME_HEADER.search(preceding[-200:])
     if m:
@@ -285,7 +307,7 @@ def _resolve_patch_target_path(content: str, marker_pos: int) -> str | None:
     return files[0] if len(files) == 1 else None
 
 
-def _try_apply_raw_patch(content: str) -> tuple[str | None, str] | None:
+def _try_apply_raw_patch(content: str) -> tuple[str | None, str, str | None] | None:
     """Detect a raw SEARCH/REPLACE (or REPLACE_FUNCTION/INSERT_AFTER/etc.)
     patch that the proxy did NOT already resolve and reconstruct into a full
     file (see _SHAPESHIFTER_RECONSTRUCTED_RE) — e.g. because ShapeShifter's
@@ -301,8 +323,22 @@ def _try_apply_raw_patch(content: str) -> tuple[str | None, str] | None:
     no patch markers at all, or the proxy already reconstructed a clean,
     trustworthy full file — see _extract_file_writes' matching check for
     why "trustworthy" isn't automatic just because the marker is present).
-    Otherwise returns (path, outcome_message); path is None if no target
-    file could be determined.
+    Otherwise returns (path, outcome_message, new_full_content); path is
+    None if no target file could be determined, new_full_content is None
+    unless the patch actually succeeded.
+
+    The caller MUST overwrite the stored assistant message's content with
+    new_full_content (via _format_file_for_context) when it's not None —
+    otherwise the conversation history still shows the model's raw,
+    unresolved <<<<<<< SEARCH text as "what calculator.py currently looks
+    like". transformers.py's own artifact tracking (_extract_latest_artifacts)
+    scans conversation TEXT for the latest code block per file, with no
+    knowledge that this module silently patched the real file out-of-band —
+    so every later turn would keep being shown stale patch syntax as
+    "current_artifacts" instead of the real file, a real bug observed in
+    practice (the model got visibly confused about which version — 799
+    bytes or 939 — was actually current, going back and forth across
+    several turns instead of making progress).
     """
     reconstructed = _SHAPESHIFTER_RECONSTRUCTED_RE.search(content)
     if reconstructed and not is_patch_response(reconstructed.group(2)):
@@ -318,28 +354,40 @@ def _try_apply_raw_patch(content: str) -> tuple[str | None, str] | None:
             "could not be applied automatically. Mention the file's path "
             "explicitly (e.g. a `path.ext` header right before the patch) "
             "and resend it."
-        )
+        ), None
     try:
         current = alfa1_tools.read_file(path)
     except Alfa1Error as exc:
-        return path, f"Could not read {path} to apply the patch: {exc}"
+        return path, f"Could not read {path} to apply the patch: {exc}", None
     if current.get("binary"):
-        return path, f"{path} is a binary file — cannot apply a text patch to it."
+        return path, f"{path} is a binary file — cannot apply a text patch to it.", None
 
     ops = parse_patch_response(content)
     new_text, ok, failed = apply_patch_ops(current["content"], ops)
     if ok == 0:
         return path, (
             f"None of the {failed} patch operation(s) matched the current "
-            f"content of {path} — it may have changed since you last saw "
-            f"it. Current content:\n\n{_format_file_for_context(path, current['content'])}"
-        )
+            f"content of {path} exactly — your SEARCH text differs from it "
+            f"somewhere (even a single missing or extra line is enough). "
+            f"Retry with a new SEARCH/REPLACE patch copied verbatim from "
+            f"the exact content below — do NOT rewrite the whole file, "
+            f"the change is still small enough for a patch:\n\n"
+            f"{_format_file_for_context(path, current['content'])}"
+        ), None
+
+    problem = _verify_content(path, new_text)
+    if problem:
+        return path, (
+            f"Patch application produced invalid content and was rejected: "
+            f"{problem}. The file was NOT modified. Current content:\n\n"
+            f"{_format_file_for_context(path, current['content'])}"
+        ), None
 
     alfa1_tools.write_file(path, new_text)
     status = f"{ok} patch{'es' if ok != 1 else ''} applied to {path}"
     if failed:
         status += f", {failed} failed (kept previous content for those)"
-    return path, status
+    return path, status, new_text
 
 
 def _format_file_for_context(path: str, text: str) -> str:
@@ -348,6 +396,40 @@ def _format_file_for_context(path: str, text: str) -> str:
     prior version — required for patch-mode to activate on later edits."""
     ext = path.rsplit(".", 1)[-1] if "." in path else ""
     return f"`{path}`\n```{ext}\n{text}\n```"
+
+
+def _verify_content(path: str, text: str) -> str | None:
+    """Deterministic, free, instant sanity check run BEFORE content is
+    written to disk — a cheap "verifier" pass that doesn't need a second LLM
+    call. Every real file-corruption bug hit in practice this session (raw
+    <<<<<<< SEARCH markers ending up as "the file", a truncated/malformed
+    patch producing broken Python) is exactly the class of problem this
+    catches. Returns None if the content looks fine, or a description of
+    what's wrong — the caller must refuse to write when this is not None,
+    reporting the problem back to the model instead of corrupting the file.
+
+    Deliberately NOT a second full LLM review pass ("does this code make
+    logical sense") — that's a real possible future enhancement, but this
+    layer is about catching mechanical corruption fast and for free, which
+    covers everything actually observed going wrong so far.
+    """
+    if is_patch_response(text):
+        return (
+            "the content still contains unresolved patch markers "
+            "(<<<<<<< SEARCH / >>>>>>> REPLACE etc.) — that looks like a "
+            "patch, not the file's actual content"
+        )
+    if path.endswith(".py"):
+        try:
+            compile(text, path, "exec")
+        except SyntaxError as exc:
+            return f"the resulting Python has a syntax error: {exc}"
+    if path.endswith(".json"):
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as exc:
+            return f"the resulting JSON is invalid: {exc}"
+    return None
 
 
 # Generous default vs. the proxy's own DEFAULT_MAX_OUTPUT_TOKENS (1200) —
@@ -360,15 +442,83 @@ def _format_file_for_context(path: str, text: str) -> str:
 _DEFAULT_MAX_TOKENS = 4096
 
 
-async def _call_self(conversation: list[dict], model: str | None) -> dict:
+async def _call_self(
+    conversation: list[dict], model: str | None,
+    on_delta: Callable[[str, str], Awaitable[None]] | None = None,
+) -> dict:
+    """Streams the completion from this same process's own
+    /v1/chat/completions endpoint, invoking on_delta(kind, text) — kind is
+    "content" or "reasoning" — as each chunk arrives, so the UI can show
+    tokens live instead of a generic "thinking" indicator. Returns the same
+    {"choices": [{"message": ..., "finish_reason": ...}]} shape a
+    non-streaming call would, by accumulating chunks — so none of the
+    post-processing below (patch detection, action parsing, tool_calls
+    stripping) needs to know streaming happened at all.
+
+    Note this means the proxy's own patch-reconstruction (Option A) never
+    applies here — wrapper_server only reconstructs full-file content for
+    non-streaming requests, forwarding raw patch text as-is for streaming
+    ones (see wrapper_server._relay_stream's docstring). That's fine: any
+    raw, unresolved patch text is handled by _try_apply_raw_patch below
+    exactly as it already needs to be for the case where the proxy's own
+    reconstruction fails, so streaming just means that path is taken more
+    often rather than needing new handling.
+    """
     payload = {
-        "model": model, "messages": conversation, "stream": False,
+        "model": model, "messages": conversation, "stream": True,
         "max_tokens": _DEFAULT_MAX_TOKENS,
     }
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_call_frags: dict[int, dict] = {}
+    finish_reason = None
+
     async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(f"{get_self_base_url()}/v1/chat/completions", json=payload)
-        resp.raise_for_status()
-        return resp.json()
+        async with client.stream(
+            "POST", f"{get_self_base_url()}/v1/chat/completions", json=payload,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choice = (chunk.get("choices") or [{}])[0]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                delta = choice.get("delta", {})
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                    if on_delta is not None:
+                        await on_delta("content", delta["content"])
+                if delta.get("reasoning"):
+                    reasoning_parts.append(delta["reasoning"])
+                    if on_delta is not None:
+                        await on_delta("reasoning", delta["reasoning"])
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_call_frags.setdefault(
+                        idx, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+
+    message: dict = {"role": "assistant", "content": "".join(content_parts)}
+    if reasoning_parts:
+        message["reasoning"] = "".join(reasoning_parts)
+    if tool_call_frags:
+        message["tool_calls"] = [tool_call_frags[i] for i in sorted(tool_call_frags)]
+    return {"choices": [{"message": message, "finish_reason": finish_reason}]}
 
 
 async def run_agent_turn(
@@ -383,13 +533,16 @@ async def run_agent_turn(
         if on_event is not None:
             await on_event(evt)
 
+    async def on_delta(kind: str, text: str) -> None:
+        await emit({"type": f"{kind}_delta", "text": text})
+
     if not conversation or conversation[0].get("role") != "system":
         conversation.insert(0, {"role": "system", "content": ALFA1_SYSTEM_PROMPT})
 
     for _ in range(max_iterations):
         await emit({"type": "thinking"})
         try:
-            resp = await _call_self(conversation, model)
+            resp = await _call_self(conversation, model, on_delta=on_delta)
         except httpx.HTTPError as exc:
             await emit({"type": "error", "message": str(exc)})
             return conversation
@@ -420,9 +573,16 @@ async def run_agent_turn(
 
         patch_result = _try_apply_raw_patch(content)
         if patch_result is not None:
-            path, outcome = patch_result
+            path, outcome, new_full_content = patch_result
             await emit({"type": "tool_call", "name": "apply_patch", "arguments": {"path": path}})
             await emit({"type": "tool_result", "name": "apply_patch", "result": outcome})
+            if new_full_content is not None:
+                # Keep stored history consistent with the real file: replace
+                # the model's raw <<<<<<< SEARCH text with what the file
+                # actually looks like now, or ShapeShifter's own artifact
+                # tracking would keep showing stale patch syntax as "current"
+                # on every later turn (see _try_apply_raw_patch's docstring).
+                message["content"] = _format_file_for_context(path, new_full_content)
             conversation.append({
                 "role": "user",
                 "content": "[alfa1] Action results from your last turn:\n\n" + outcome,
@@ -473,11 +633,18 @@ async def run_agent_turn(
 
         for path, file_content in file_writes:
             await emit({"type": "tool_call", "name": "write_file", "arguments": {"path": path}})
-            try:
-                r = alfa1_tools.write_file(path, file_content)
-                results.append(f"Wrote {path} ({r['bytes_written']} bytes)")
-            except Alfa1Error as exc:
-                results.append(f"Error writing {path}: {exc}")
+            problem = _verify_content(path, file_content)
+            if problem:
+                results.append(
+                    f"Refused to write {path}: {problem}. The file was NOT "
+                    f"modified — resend the correct content."
+                )
+            else:
+                try:
+                    r = alfa1_tools.write_file(path, file_content)
+                    results.append(f"Wrote {path} ({r['bytes_written']} bytes)")
+                except Alfa1Error as exc:
+                    results.append(f"Error writing {path}: {exc}")
             await emit({"type": "tool_result", "name": "write_file", "result": results[-1]})
 
         for name, arg in actions:

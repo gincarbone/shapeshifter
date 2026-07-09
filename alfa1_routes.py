@@ -22,6 +22,7 @@ _conversation: list[dict] = []
 _turn_status: str = "idle"   # "idle" | "working" | "ok" | "error"
 _sse_queues: list[asyncio.Queue] = []
 _current_task: asyncio.Task | None = None   # the in-flight run_agent_turn task, if any
+_pending_queue: list[dict] = []             # FIFO of {"message": str, "model": str|None} waiting their turn
 
 
 async def _broadcast(evt: dict) -> None:
@@ -50,6 +51,13 @@ async def _activate_workspace(path: str) -> dict:
     restart (or the tab just being closed and reopened) doesn't silently
     lose in-progress work the way plain in-memory-only state would."""
     global _turn_status
+    # Clear the queue BEFORE cancelling: _cancel_current_task awaits the
+    # cancelled task, whose finally block calls _drain_queue() — if the
+    # queue still had entries at that point, a stale queued message could
+    # start a brand new turn (appending to _conversation, spawning a new
+    # _current_task) in the middle of switching workspaces, immediately
+    # orphaned by the .clear() below.
+    _pending_queue.clear()
     await _cancel_current_task()
     result = alfa1_tools.set_workspace(path)
     history = alfa1_tools.load_history()
@@ -146,6 +154,7 @@ async def reset_conversation():
     but leaves an empty history.json in place (via save_history below) —
     the next turn resumes normal persistence immediately."""
     global _turn_status
+    _pending_queue.clear()  # see _activate_workspace's comment for why this must run before cancel
     await _cancel_current_task()
     _conversation.clear()
     _turn_status = "idle"
@@ -160,6 +169,7 @@ async def clear_all_sessions():
     persisted history.json file for the current workspace entirely, not
     just the in-memory conversation."""
     global _turn_status
+    _pending_queue.clear()  # see _activate_workspace's comment for why this must run before cancel
     await _cancel_current_task()
     _conversation.clear()
     _turn_status = "idle"
@@ -194,19 +204,12 @@ async def _cancel_current_task() -> bool:
     return False
 
 
-@router.post("/chat")
-async def post_chat(request: Request):
-    global _turn_status
-    if _turn_status == "working":
-        return JSONResponse({"error": "A turn is already in progress"}, status_code=400)
-    if alfa1_tools.get_workspace() is None:
-        return JSONResponse({"error": "No workspace selected"}, status_code=400)
-
-    body, err = await _read_json(request)
-    if err:
-        return err
-    message = body.get("message", "")
-    model = body.get("model")
+async def _start_turn(message: str, model: str | None) -> None:
+    """Kick off a turn for `message` right now. Callers must only invoke
+    this when _turn_status != "working" — post_chat enforces that by
+    queueing instead of calling this directly when a turn is already
+    running; _drain_queue re-checks it too before calling this itself."""
+    global _turn_status, _current_task
 
     _conversation.append({"role": "user", "content": message})
     _turn_status = "working"
@@ -229,10 +232,41 @@ async def post_chat(request: Request):
             await _broadcast({"type": "error", "message": str(exc)})
         finally:
             alfa1_tools.save_history(_conversation)
+            await _drain_queue()
 
-    global _current_task
     _current_task = asyncio.create_task(_run())
-    return {"accepted": True}
+
+
+async def _drain_queue() -> None:
+    """Start the next queued message, if any — called after every turn
+    finishes (including cancelled/errored ones, via _start_turn's finally
+    block) so messages sent while the agent was busy aren't silently
+    dropped the way a hard-reject would have."""
+    if _pending_queue and _turn_status != "working":
+        next_item = _pending_queue.pop(0)
+        await _broadcast({"type": "queue_update", "pending": len(_pending_queue)})
+        await _start_turn(next_item["message"], next_item.get("model"))
+
+
+@router.post("/chat")
+async def post_chat(request: Request):
+    if alfa1_tools.get_workspace() is None:
+        return JSONResponse({"error": "No workspace selected"}, status_code=400)
+
+    body, err = await _read_json(request)
+    if err:
+        return err
+    message = body.get("message", "")
+    model = body.get("model")
+
+    if _turn_status == "working":
+        _pending_queue.append({"message": message, "model": model})
+        position = len(_pending_queue)
+        await _broadcast({"type": "queued", "message": message, "position": position})
+        return {"accepted": True, "queued": True, "position": position}
+
+    await _start_turn(message, model)
+    return {"accepted": True, "queued": False}
 
 
 @router.get("/stream")

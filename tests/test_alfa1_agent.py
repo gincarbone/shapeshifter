@@ -6,12 +6,17 @@ _is_agentic bypass ShapeShifter's own input/output token-savings pipeline)."""
 from __future__ import annotations
 
 import asyncio
+import json
 
+import httpx
 import pytest
 
 import alfa1_agent
 import alfa1_tools
-from alfa1_agent import _describe_tool_attempt, _extract_file_writes, run_agent_turn
+from alfa1_agent import (
+    _describe_tool_attempt, _extract_file_writes, _resolve_patch_target_path,
+    _try_apply_raw_patch, _verify_content, run_agent_turn,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -152,7 +157,7 @@ def test_run_agent_turn_applies_the_real_patch_when_reconstruction_has_leftover_
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message(
@@ -219,7 +224,7 @@ def _assistant_message(content, finish_reason="stop"):
 def test_run_agent_turn_no_actions_returns_immediately(monkeypatch):
     events = []
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         return _assistant_message("hello there")
 
     monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
@@ -236,13 +241,76 @@ def test_run_agent_turn_no_actions_returns_immediately(monkeypatch):
     assert conversation[0]["role"] == "system"
 
 
+def test_verify_content_accepts_valid_python():
+    assert _verify_content("app.py", "def f():\n    return 1\n") is None
+
+
+def test_verify_content_rejects_syntax_broken_python():
+    problem = _verify_content("app.py", "def f(:\n    return 1\n")
+    assert problem is not None
+    assert "syntax error" in problem
+
+
+def test_verify_content_rejects_leftover_patch_markers():
+    problem = _verify_content("app.py", "<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE\n")
+    assert problem is not None
+    assert "patch markers" in problem
+
+
+def test_verify_content_accepts_valid_json():
+    assert _verify_content("data.json", '{"a": 1}') is None
+
+
+def test_verify_content_rejects_broken_json():
+    problem = _verify_content("data.json", '{"a": 1,}')
+    assert problem is not None
+    assert "invalid" in problem
+
+
+def test_verify_content_ignores_non_checked_extensions():
+    # .txt/.md/etc. have no dedicated syntax check — anything not caught by
+    # the universal patch-marker check is accepted.
+    assert _verify_content("notes.txt", "this is not valid python at all (") is None
+
+
+def test_run_agent_turn_refuses_to_write_syntax_broken_python(monkeypatch, tmp_path):
+    """The verifier must reject bad content BEFORE it touches disk — the
+    file must be left exactly as it was, not corrupted, and the model gets
+    a corrective message instead of a silently broken file."""
+    import alfa1_tools
+    alfa1_tools.set_workspace(str(tmp_path))
+
+    calls = {"n": 0}
+
+    async def fake_call_self(conversation, model, on_delta=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _assistant_message("`app.py`\n```python\ndef f(:\n    return 1\n```\n")
+        return _assistant_message("done")
+
+    monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
+
+    events = []
+
+    async def on_event(evt):
+        events.append(evt)
+
+    conversation = [{"role": "user", "content": "write app.py"}]
+    asyncio.run(run_agent_turn(conversation, on_event=on_event))
+
+    assert not (tmp_path / "app.py").exists()
+    tool_results = [e for e in events if e["type"] == "tool_result"]
+    assert tool_results and "Refused to write" in tool_results[0]["result"]
+    assert "syntax error" in tool_results[0]["result"]
+
+
 def test_run_agent_turn_writes_file_then_stops(monkeypatch, tmp_path):
     import alfa1_tools
     alfa1_tools.set_workspace(str(tmp_path))
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message("`a.txt`\n```\nhello\n```\n")
@@ -274,7 +342,7 @@ def test_run_agent_turn_executes_run_command_tag(monkeypatch, tmp_path):
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message(
@@ -299,7 +367,7 @@ def test_run_agent_turn_read_file_wraps_result_as_artifact(monkeypatch, tmp_path
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message("<alfa1:read_file>existing.py</alfa1:read_file>")
@@ -323,7 +391,7 @@ def test_run_agent_turn_search_files_action(monkeypatch, tmp_path):
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message("<alfa1:search_files>target_fn</alfa1:search_files>")
@@ -346,7 +414,7 @@ def test_run_agent_turn_action_error_does_not_crash_loop(monkeypatch, tmp_path):
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message("<alfa1:read_file>missing.txt</alfa1:read_file>")
@@ -382,6 +450,52 @@ def test_extract_file_writes_does_not_write_unresolved_raw_patch_markers(tmp_pat
     assert _extract_file_writes(content) == []
 
 
+def test_resolve_patch_target_path_finds_header_before_the_fence_not_the_marker():
+    """Regression test for a real observed bug: every apply_patch attempt in
+    a live session failed repeatedly with "didn't clearly specify which
+    file it targets" — {"path": null} — even though the model correctly
+    wrote `calculator.py` right before the fence every single time. The
+    marker sits INSIDE the fence, several lines after the header, so
+    searching for the header immediately before the marker's position
+    always missed it; the fix looks right before the fence-open instead."""
+    content = (
+        "`calculator.py`\n```python\n"
+        "<<<<<<< SEARCH\n"
+        "        elif op == \"/\":\n"
+        "=======\n"
+        "        elif op == \"**\":\n"
+        ">>>>>>> REPLACE\n"
+        "```"
+    )
+    marker_pos = content.index("<<<<<<< SEARCH")
+    assert _resolve_patch_target_path(content, marker_pos) == "calculator.py"
+
+
+def test_try_apply_raw_patch_resolves_path_with_header_before_fence(tmp_path):
+    import alfa1_tools
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / "calculator.py").write_text(
+        'def calculator(op):\n    if op == "/":\n        pass\n', encoding="utf-8",
+    )
+    content = (
+        "`calculator.py`\n```python\n"
+        "<<<<<<< SEARCH\n"
+        '    if op == "/":\n'
+        "=======\n"
+        '    if op == "**":\n'
+        ">>>>>>> REPLACE\n"
+        "```"
+    )
+    result = _try_apply_raw_patch(content)
+    assert result is not None
+    path, outcome, new_full_content = result
+    assert path == "calculator.py"
+    assert "1 patch applied" in outcome
+    assert new_full_content is not None
+    assert 'if op == "**":' in new_full_content
+    assert 'if op == "**":' in (tmp_path / "calculator.py").read_text(encoding="utf-8")
+
+
 def test_run_agent_turn_applies_raw_unresolved_patch_directly_to_disk(monkeypatch, tmp_path):
     """The core regression: previously this raw patch text got written to
     calculator.py VERBATIM (literally the <<<<<<< SEARCH markers), corrupting
@@ -394,7 +508,7 @@ def test_run_agent_turn_applies_raw_unresolved_patch_directly_to_disk(monkeypatc
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message(
@@ -435,7 +549,7 @@ def test_run_agent_turn_raw_patch_that_matches_nothing_reports_current_content(m
 
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message(
@@ -458,6 +572,102 @@ def test_run_agent_turn_raw_patch_that_matches_nothing_reports_current_content(m
     assert (tmp_path / "calculator.py").read_text(encoding="utf-8") == "def calculator():\n    pass\n"
     user_msgs = [m for m in conversation if m.get("role") == "user"]
     assert any("did not match" in m["content"] or "None of the" in m["content"] for m in user_msgs)
+    # Regression: observed in practice — after a failed patch match (one
+    # missing line vs. the real file), the model fell back to rewriting the
+    # whole file instead of retrying with a corrected patch, silently
+    # forfeiting output-token savings for that turn even though nothing
+    # forced it to. The retry message must explicitly steer it back to
+    # patching instead of just showing the content and hoping.
+    assert any("do NOT rewrite the whole file" in m["content"] for m in user_msgs)
+
+
+def test_run_agent_turn_resolves_patch_path_with_multiple_files_in_workspace(monkeypatch, tmp_path):
+    """The single-file-in-workspace fallback in _resolve_patch_target_path
+    masked the header-adjacency bug in earlier tests (a tmp_path with only
+    one file always resolved correctly "by luck" through the fallback, even
+    while the primary header-detection path was broken). The real session
+    that surfaced the bug had multiple files, where the fallback can't
+    apply and correct header detection is the only way to resolve the
+    target — repro that shape here so the fallback can't mask a regression."""
+    import alfa1_tools
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / "calculator.py").write_text(
+        'def calculator(op):\n    if op == "/":\n        pass\n', encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("notes\n", encoding="utf-8")
+
+    calls = {"n": 0}
+
+    async def fake_call_self(conversation, model, on_delta=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _assistant_message(
+                "`calculator.py`\n```python\n"
+                "<<<<<<< SEARCH\n"
+                '    if op == "/":\n'
+                "=======\n"
+                '    if op == "**":\n'
+                ">>>>>>> REPLACE\n"
+                "```"
+            )
+        return _assistant_message("done")
+
+    monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
+
+    events = []
+
+    async def on_event(evt):
+        events.append(evt)
+
+    conversation = [{"role": "user", "content": "add power operator"}]
+    asyncio.run(run_agent_turn(conversation, on_event=on_event))
+
+    tool_results = [e for e in events if e["type"] == "tool_result"]
+    assert tool_results and "1 patch applied" in tool_results[0]["result"]
+    assert 'if op == "**":' in (tmp_path / "calculator.py").read_text(encoding="utf-8")
+
+
+def test_run_agent_turn_rewrites_history_after_successful_patch_to_avoid_stale_context(monkeypatch, tmp_path):
+    """Regression test for a real observed bug: after a successful
+    apply_patch, the stored assistant message still contained the model's
+    raw <<<<<<< SEARCH text (the file on disk was correctly patched, but the
+    CONVERSATION HISTORY was not updated to match). Since transformers.py's
+    own artifact tracking (_extract_latest_artifacts) scans conversation
+    TEXT for the latest code block per file — with no idea this module
+    silently patched the real file out-of-band — every later turn kept
+    being shown stale patch syntax as "the current file", and the model
+    visibly got confused about which byte count/version was current,
+    flip-flopping across several turns instead of making progress. The
+    stored message must be rewritten to show the real resulting content."""
+    import alfa1_tools
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / "calculator.py").write_text(
+        'def calculator(op):\n    if op == "/":\n        pass\n', encoding="utf-8",
+    )
+
+    async def fake_call_self(conversation, model, on_delta=None):
+        return _assistant_message(
+            "`calculator.py`\n```python\n"
+            "<<<<<<< SEARCH\n"
+            '    if op == "/":\n'
+            "=======\n"
+            '    if op == "**":\n'
+            ">>>>>>> REPLACE\n"
+            "```"
+        )
+
+    monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
+
+    conversation = [{"role": "user", "content": "add power operator"}]
+    asyncio.run(run_agent_turn(conversation, max_iterations=1))
+
+    assistant_msgs = [m for m in conversation if m.get("role") == "assistant"]
+    assert len(assistant_msgs) == 1
+    stored_content = assistant_msgs[0]["content"]
+    assert "<<<<<<< SEARCH" not in stored_content
+    assert ">>>>>>> REPLACE" not in stored_content
+    assert 'if op == "**":' in stored_content
+    assert "`calculator.py`" in stored_content
 
 
 def _assistant_message_with_reasoning(content, reasoning):
@@ -465,7 +675,7 @@ def _assistant_message_with_reasoning(content, reasoning):
 
 
 def test_run_agent_turn_emits_reasoning_event(monkeypatch):
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         return _assistant_message_with_reasoning("hello there", "thinking about it")
 
     monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
@@ -509,15 +719,15 @@ def test_describe_tool_attempt_handles_empty_reply():
 
 
 def test_run_agent_turn_includes_description_in_unrecognized_event(monkeypatch):
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         return _assistant_message_with_tool_calls(
             "", [{"function": {"name": "shapeshifter_read_file", "arguments": '{"path": "a.py"}'}}],
         ) if fake_call_self.calls == 0 else _assistant_message("ok")
 
     fake_call_self.calls = 0
 
-    async def wrapped(conversation, model):
-        result = await fake_call_self(conversation, model)
+    async def wrapped(conversation, model, on_delta=None):
+        result = await fake_call_self(conversation, model, on_delta)
         fake_call_self.calls += 1
         return result
 
@@ -540,7 +750,7 @@ def test_run_agent_turn_includes_description_in_unrecognized_event(monkeypatch):
 def test_run_agent_turn_detects_unrecognized_tool_syntax_and_retries(monkeypatch):
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message(
@@ -582,7 +792,7 @@ def test_run_agent_turn_strips_native_tool_calls_before_storing_in_history(monke
     stored history."""
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message_with_tool_calls(
@@ -604,7 +814,7 @@ def test_run_agent_turn_strips_native_tool_calls_before_storing_in_history(monke
 def test_run_agent_turn_treats_native_tool_call_attempt_as_unrecognized(monkeypatch):
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message_with_tool_calls(
@@ -639,7 +849,7 @@ def test_run_agent_turn_detects_truncated_reply_and_retries(monkeypatch):
     turn's final answer instead of retrying."""
     calls = {"n": 0}
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _assistant_message("<alfa1:read_file>calc", finish_reason="length")
@@ -662,46 +872,98 @@ def test_run_agent_turn_detects_truncated_reply_and_retries(monkeypatch):
     assert len(corrective) == 1
 
 
+def _sse_transport(body: bytes, captured_requests: list | None = None):
+    """httpx.MockTransport serving a canned SSE stream — same technique
+    proven in tests/test_llm_client.py's real-streaming tests, reused here
+    since _call_self now streams from the proxy the same way llm_client's
+    stream_upstream streams from the upstream provider."""
+    def handler(request):
+        if captured_requests is not None:
+            captured_requests.append(json.loads(request.content))
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+    return httpx.MockTransport(handler)
+
+
 def test_call_self_requests_a_generous_max_tokens(monkeypatch):
     """Regression guard for the same truncation bug from the other
     direction: the loopback call must ask for enough tokens that a verbose
     reasoning model's response isn't cut off mid-action in the first place —
     the proxy's own DEFAULT_MAX_OUTPUT_TOKENS (1200) was observed to be too
     small for this in practice."""
-    captured = {}
+    body = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    captured = []
+    real_async_client = httpx.AsyncClient
 
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return _assistant_message("ok")
-
-    class FakeAsyncClient:
-        def __init__(self, *a, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def post(self, url, json):
-            captured.update(json)
-            return FakeResponse()
-
-    monkeypatch.setattr(alfa1_agent.httpx, "AsyncClient", FakeAsyncClient)
+    def factory(*a, **kw):
+        return real_async_client(transport=_sse_transport(body, captured))
+    monkeypatch.setattr(alfa1_agent.httpx, "AsyncClient", factory)
 
     asyncio.run(alfa1_agent._call_self([{"role": "user", "content": "hi"}], None))
-    assert captured["max_tokens"] >= 4096
+    assert captured[0]["max_tokens"] >= 4096
+    assert captured[0]["stream"] is True
+
+
+def test_call_self_parses_streamed_chunks_and_invokes_on_delta(monkeypatch):
+    body = (
+        b'data: {"choices":[{"index":0,"delta":{"reasoning":"thinking..."}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    real_async_client = httpx.AsyncClient
+
+    def factory(*a, **kw):
+        return real_async_client(transport=_sse_transport(body))
+    monkeypatch.setattr(alfa1_agent.httpx, "AsyncClient", factory)
+
+    deltas = []
+
+    async def on_delta(kind, text):
+        deltas.append((kind, text))
+
+    resp = asyncio.run(alfa1_agent._call_self([{"role": "user", "content": "hi"}], None, on_delta=on_delta))
+    assert deltas == [("reasoning", "thinking..."), ("content", "Hello"), ("content", " world")]
+    message = resp["choices"][0]["message"]
+    assert message["content"] == "Hello world"
+    assert message["reasoning"] == "thinking..."
+    assert resp["choices"][0]["finish_reason"] == "stop"
+
+
+def test_call_self_reassembles_streamed_tool_call_fragments(monkeypatch):
+    chunks = [
+        {"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "function": {"name": "read_", "arguments": ""}},
+        ]}}]},
+        {"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "file", "arguments": '{"path"'}},
+        ]}}]},
+        {"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": ': "a.py"}'}},
+        ]}}]},
+    ]
+    body = b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks) + b"data: [DONE]\n\n"
+    real_async_client = httpx.AsyncClient
+
+    def factory(*a, **kw):
+        return real_async_client(transport=_sse_transport(body))
+    monkeypatch.setattr(alfa1_agent.httpx, "AsyncClient", factory)
+
+    resp = asyncio.run(alfa1_agent._call_self([{"role": "user", "content": "hi"}], None))
+    tool_calls = resp["choices"][0]["message"]["tool_calls"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["id"] == "call_1"
+    assert tool_calls[0]["function"]["name"] == "read_file"
+    assert tool_calls[0]["function"]["arguments"] == '{"path": "a.py"}'
 
 
 def test_run_agent_turn_stops_at_max_iterations(monkeypatch, tmp_path):
     import alfa1_tools
     alfa1_tools.set_workspace(str(tmp_path))
 
-    async def fake_call_self(conversation, model):
+    async def fake_call_self(conversation, model, on_delta=None):
         return _assistant_message("<alfa1:list_files>.</alfa1:list_files>")
 
     monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)

@@ -25,13 +25,24 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);fon
 *::-webkit-scrollbar-thumb:hover{background:var(--accent)}
 *::-webkit-scrollbar-corner{background:var(--bg)}
 
-/* ---- layout / columns ---- */
+/* ---- layout / columns ----
+   Widths use vw (viewport-relative) instead of fixed px so the layout
+   scales proportionally across resolutions — a 400px column is generous on
+   a small laptop screen and tiny on a 4K monitor. min/max-width in px stay
+   as safety rails only, so columns never become unusably narrow (small
+   screen) or absurdly wide (ultra-wide screen) regardless of the vw value.
+   col3's flex-basis mirrors col2's vw width so the two start equal-sized
+   at load on any resolution, not just coincidentally at one fixed size;
+   flex-grow:1 still lets col3 fill any leftover viewport width beyond
+   col1+col2+col3. Once the user drags a resizer, that column switches to
+   an explicit px width (see setupResizer) and no longer scales with the
+   viewport — expected, matching how a manual resize should behave. */
 #layout{display:flex;height:100vh}
-#col1{width:260px;min-width:160px;max-width:600px;background:var(--panel);border-right:1px solid var(--border);
+#col1{width:16vw;min-width:160px;max-width:420px;background:var(--panel);border-right:1px solid var(--border);
       display:flex;flex-direction:column}
-#col2{width:400px;min-width:200px;max-width:900px;border-right:1px solid var(--border);
+#col2{width:26vw;min-width:220px;max-width:640px;border-right:1px solid var(--border);
       display:flex;flex-direction:column}
-#col3{flex:1;min-width:280px;display:flex;flex-direction:column}
+#col3{flex:1 1 26vw;min-width:280px;display:flex;flex-direction:column}
 .resizer{width:5px;cursor:col-resize;background:var(--border);flex-shrink:0}
 .resizer:hover,.resizer.active{background:var(--accent)}
 
@@ -42,10 +53,12 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);fon
 #workspace-bar{padding:5px 12px;font-size:9px;color:var(--muted);border-bottom:1px solid var(--border);
                white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
 #tree{flex:1;overflow:auto;padding:6px}
-.tree-entry{padding:3px 6px;border-radius:3px;cursor:pointer;white-space:nowrap;font-size:11px;color:var(--text)}
+.tree-entry{padding:4px 6px;border-radius:4px;cursor:pointer;white-space:nowrap;font-size:11px;color:var(--text);
+            display:flex;align-items:center;gap:6px}
 .tree-entry:hover{background:rgba(124,106,247,.12)}
-.tree-entry.dir{color:var(--muted);font-weight:600}
+.tree-entry.dir{color:var(--text);font-weight:600}
 .tree-entry.active{background:rgba(124,106,247,.25)}
+.tree-icon{font-size:12px;line-height:1;flex-shrink:0}
 #stats-cards{display:flex;flex-direction:column;gap:8px;padding:10px;border-top:1px solid var(--border);flex-shrink:0}
 .stat-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
 .stat-card .label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
@@ -74,6 +87,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);fon
   opacity:0;transform:translateX(-6px);
   animation:alfa1-line-in .32s ease-out forwards;
 }
+.code-line.code-line-static{opacity:1;transform:none;animation:none;filter:none}
 @keyframes alfa1-line-in{
   0%{opacity:0;transform:translateX(-6px);
      filter:drop-shadow(0 0 5px #22d3ee) drop-shadow(0 0 10px rgba(124,106,247,.8))}
@@ -118,6 +132,11 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);fon
 .tool-badge{display:inline-block;padding:1px 6px;border-radius:3px;color:#0f1117;font-weight:700;
             font-size:9px;text-transform:none;letter-spacing:0}
 .msg-body{white-space:pre-wrap;word-break:break-word}
+.msg-live{border-color:#22d3ee;box-shadow:0 0 8px rgba(34,211,238,.25)}
+.msg-live .msg-body::after{
+  content:'\\u2588';color:#22d3ee;margin-left:1px;
+  animation:alfa1-blink .8s steps(1) infinite;
+}
 
 .msg-thinking{display:flex;gap:4px;align-items:center;background:var(--panel);border:1px solid var(--border);
               align-self:flex-start;padding:10px 12px;width:fit-content}
@@ -186,23 +205,59 @@ async function pickFolder(){
   if(j.root){ workspaceRoot = j.root; updateWorkspaceBar(); hidePicker(); loadTree(); }
 }
 
-/* ---------- file tree ---------- */
+/* ---------- file tree ----------
+ * The backend already returns the FULL recursive listing in one call (see
+ * alfa1_tools.list_tree), so this builds a collapsible tree purely
+ * client-side: expandedDirs tracks which folders are open, and an entry is
+ * only rendered if every one of its ancestor directories is in that set —
+ * no re-fetch needed on expand/collapse, only on an actual file-tree
+ * change (loadTree() is called after every write/delete/patch already). */
+let treeEntries = [];
+let expandedDirs = new Set();
+
+const FILE_ICONS = {
+  py:'🐍', js:'📜', jsx:'📜', mjs:'📜', ts:'📘', tsx:'📘',
+  css:'🎨', scss:'🎨', html:'🌐', htm:'🌐', json:'📋', yml:'⚙️', yaml:'⚙️',
+  toml:'⚙️', ini:'⚙️', cfg:'⚙️', md:'📝', txt:'📝', sh:'💻', bash:'💻',
+  png:'🖼️', jpg:'🖼️', jpeg:'🖼️', gif:'🖼️', svg:'🖼️', ico:'🖼️',
+};
+function fileIcon(path){
+  const ext = path.includes('.') ? path.split('.').pop().toLowerCase() : '';
+  return FILE_ICONS[ext] || '📄';
+}
+
 async function loadTree(){
   const r = await fetch('/alfa1/files/tree?path=.');
   const j = await r.json();
-  renderTree(j.entries || []);
+  treeEntries = j.entries || [];
+  renderTree();
 }
-function renderTree(entries){
+function toggleDir(path){
+  if(expandedDirs.has(path)){
+    expandedDirs.delete(path);
+    // collapse descendants too, so re-expanding always starts from a clean state
+    for(const p of Array.from(expandedDirs)){ if(p.startsWith(path + '/')) expandedDirs.delete(p); }
+  } else {
+    expandedDirs.add(path);
+  }
+  renderTree();
+}
+function renderTree(){
   const el = document.getElementById('tree');
   el.innerHTML = '';
-  for(const e of entries){
-    const depth = e.path.split('/').length - 1;
+  for(const e of treeEntries){
+    const parts = e.path.split('/');
+    const depth = parts.length - 1;
+    const parentPath = parts.slice(0, -1).join('/');
+    if(depth > 0 && !expandedDirs.has(parentPath)) continue;
+    const isDir = e.type === 'dir';
     const div = document.createElement('div');
-    div.className = 'tree-entry ' + (e.type === 'dir' ? 'dir' : 'file');
-    div.style.paddingLeft = (6 + depth*14) + 'px';
-    div.textContent = (e.type === 'dir' ? '\\u25b8 ' : '') + e.path.split('/').pop();
+    div.className = 'tree-entry ' + (isDir ? 'dir' : 'file');
+    div.style.paddingLeft = (6 + depth * 14) + 'px';
+    const icon = isDir ? (expandedDirs.has(e.path) ? '📂' : '📁') : fileIcon(e.path);
+    div.innerHTML = '<span class="tree-icon">' + icon + '</span>' + escapeHtml(parts[parts.length - 1]);
     div.title = e.path;
-    if(e.type === 'file'){ div.onclick = () => openFile(e.path); }
+    div.onclick = isDir ? (() => toggleDir(e.path)) : (() => openFile(e.path));
     el.appendChild(div);
   }
 }
@@ -333,32 +388,62 @@ function renderActiveFile(){
 }
 async function openFileFresh(path){
   // Like openFile, but always refetches even if a tab is already open, and
-  // animates the new content materializing in rather than snapping to it
-  // instantly — used after the agent writes/patches a file so column 2
-  // visibly shows the change happening, not just the end result.
+  // reveals the new content against whatever was already shown for this
+  // file — used after the agent writes/patches a file so column 2 shows
+  // exactly what changed, not a full re-type of the whole file nor the
+  // model's raw patch syntax (that only ever appears in the reasoning/tool
+  // log on the right, never in the code pane).
   const r = await fetch('/alfa1/files/content?path=' + encodeURIComponent(path));
   const j = await r.json();
   if(j.error){ return; }
   let tab = openTabs.find(t => t.path === path);
+  const oldContent = tab ? tab.content : null;
   if(!tab){ tab = {path, content: j.content, binary: j.binary}; openTabs.push(tab); }
   else { tab.content = j.content; tab.binary = j.binary; }
   activeTab = path;
   renderTabs();
   if(tab.binary){ renderActiveFile(); return; }
-  revealCode(tab.content || '', extToLang(tab.path));
+  revealCode(tab.content || '', extToLang(tab.path), oldContent);
 }
 
-function revealCode(code, lang){
-  // Line-by-line "materializing" reveal, cyberpunk-terminal style: each
-  // line fades/glows in with a neon drop-shadow that settles to normal, a
-  // scanline sweeps down the pane while it runs, and a blinking cursor
-  // tracks the reveal point. Highlighting is done per-line (not on the
-  // whole file at once like renderActiveFile does) so a construct spanning
+function diffLines(oldLines, newLines){
+  // Line-level LCS diff: returns newLines annotated with whether each one
+  // existed unchanged (in order) in oldLines or is new/changed. Good enough
+  // for the size of files this agent deals with — not trying to be a full
+  // Myers diff, just enough to tell "same line" from "changed line" so the
+  // reveal only animates what actually moved.
+  const m = oldLines.length, n = newLines.length;
+  const dp = Array.from({length: m + 1}, () => new Array(n + 1).fill(0));
+  for(let i = m - 1; i >= 0; i--){
+    for(let j = n - 1; j >= 0; j--){
+      dp[i][j] = oldLines[i] === newLines[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const result = [];
+  let i = 0, j = 0;
+  while(i < m && j < n){
+    if(oldLines[i] === newLines[j]){ result.push({text: newLines[j], changed: false}); i++; j++; }
+    else if(dp[i + 1][j] >= dp[i][j + 1]){ i++; }
+    else { result.push({text: newLines[j], changed: true}); j++; }
+  }
+  while(j < n){ result.push({text: newLines[j], changed: true}); j++; }
+  return result;
+}
+
+function revealCode(code, lang, oldContent){
+  // "Materializing" reveal, cyberpunk-terminal style: changed lines fade/
+  // glow in with a neon drop-shadow that settles to normal and a blinking
+  // cursor tracks the reveal point; UNCHANGED lines (per diffLines against
+  // whatever this file showed before) appear instantly, statically, with
+  // no animation — so editing one function doesn't re-type the whole file.
+  // With no prior content to diff against (a brand-new file), every line
+  // is treated as changed. Highlighting is done per-line (not on the whole
+  // file at once like renderActiveFile does) so a construct spanning
   // multiple lines (a block comment, a multi-line string) can't leave an
-  // unclosed <span> straddling two separately-inserted line elements —
-  // a real risk if the combined highlighted HTML were naively split on
-  // '\\n'. Purely a cosmetic simplification: only this animated reveal
-  // loses cross-line highlighting fidelity, not the normal static view.
+  // unclosed <span> straddling two separately-inserted line elements — a
+  // real risk if the combined highlighted HTML were naively split on '\\n'.
+  // Purely a cosmetic simplification: only this animated reveal loses
+  // cross-line highlighting fidelity, not the normal static view.
   const view = document.getElementById('code-view');
   view.innerHTML = '';
   const pre = document.createElement('pre');
@@ -367,9 +452,12 @@ function revealCode(code, lang){
   view.appendChild(pre);
   view.classList.add('revealing');
 
-  const lines = code.split('\\n');
-  const total = lines.length || 1;
-  const perLineMs = Math.max(3, Math.min(35, Math.floor(700 / total)));
+  const newLines = code.split('\\n');
+  const steps = oldContent != null
+    ? diffLines(oldContent.split('\\n'), newLines)
+    : newLines.map(text => ({text, changed: true}));
+  const changedCount = steps.filter(s => s.changed).length || 1;
+  const perLineMs = Math.max(3, Math.min(35, Math.floor(700 / changedCount)));
   let i = 0;
 
   function finish(){
@@ -385,17 +473,20 @@ function revealCode(code, lang){
   function step(){
     const prevCursor = pre.querySelector('.reveal-cursor');
     if(prevCursor){ prevCursor.remove(); }
-    if(i >= lines.length){ finish(); return; }
+    if(i >= steps.length){ finish(); return; }
+    const s = steps[i];
     const div = document.createElement('div');
-    div.className = 'code-line';
-    div.innerHTML = highlight(lines[i], lang) || '\\u00a0';
-    const cursor = document.createElement('span');
-    cursor.className = 'reveal-cursor';
-    div.appendChild(cursor);
+    div.className = s.changed ? 'code-line' : 'code-line code-line-static';
+    div.innerHTML = highlight(s.text, lang) || '\\u00a0';
+    if(s.changed){
+      const cursor = document.createElement('span');
+      cursor.className = 'reveal-cursor';
+      div.appendChild(cursor);
+    }
     pre.appendChild(div);
     view.scrollTop = view.scrollHeight;
     i++;
-    if(i < lines.length){ setTimeout(step, perLineMs); } else { finish(); }
+    if(i < steps.length){ setTimeout(step, s.changed ? perLineMs : 0); } else { finish(); }
   }
   step();
 }
@@ -471,6 +562,24 @@ function showThinking(){
 function hideThinking(){
   if(thinkingEl){ thinkingEl.remove(); thinkingEl = null; }
 }
+let liveReasoningEl = null, liveContentEl = null;
+function appendDelta(kind, text){
+  hideThinking();
+  if(kind === 'reasoning'){
+    if(!liveReasoningEl){ liveReasoningEl = addMsg('reasoning', ''); liveReasoningEl.classList.add('msg-live'); }
+    liveReasoningEl.querySelector('.msg-body').textContent += text;
+  } else {
+    if(!liveContentEl){ liveContentEl = addMsg('assistant', ''); liveContentEl.classList.add('msg-live'); }
+    liveContentEl.querySelector('.msg-body').textContent += text;
+  }
+  const log = document.getElementById('chat-log');
+  log.scrollTop = log.scrollHeight;
+}
+function clearLiveDeltas(){
+  if(liveReasoningEl){ liveReasoningEl.remove(); liveReasoningEl = null; }
+  if(liveContentEl){ liveContentEl.remove(); liveContentEl = null; }
+}
+
 function setStatus(status){
   const bar = document.getElementById('status-bar');
   bar.className = 'status-' + status;
@@ -508,6 +617,8 @@ async function sendMessage(){
     // stale tree/path — re-sync instead of leaving the user stuck on a
     // confusing error with no obvious next step.
     if(String(j.error).toLowerCase().includes('workspace')){ checkWorkspace(); }
+  } else if(j.queued){
+    addMsg('tool', 'Queued (position ' + j.position + ') — the agent is still busy with a previous message.');
   }
 }
 
@@ -518,33 +629,41 @@ function connectAgentStream(){
   es.onmessage = (ev) => {
     try{
       const msg = JSON.parse(ev.data);
-      if(msg.type === 'status'){ setStatus(msg.status); if(msg.status !== 'working') hideThinking(); }
+      if(msg.type === 'status'){ setStatus(msg.status); if(msg.status !== 'working'){ hideThinking(); clearLiveDeltas(); } }
       else if(msg.type === 'thinking'){ showThinking(); }
-      else if(msg.type === 'reasoning'){ hideThinking(); addMsg('reasoning', msg.content); }
+      else if(msg.type === 'reasoning_delta'){ appendDelta('reasoning', msg.text); }
+      else if(msg.type === 'content_delta'){ appendDelta('content', msg.text); }
+      else if(msg.type === 'reasoning'){ hideThinking(); clearLiveDeltas(); addMsg('reasoning', msg.content); }
       else if(msg.type === 'tool_call'){
-        hideThinking();
+        hideThinking(); clearLiveDeltas();
         addToolMsg('call', msg.name, JSON.stringify(msg.arguments));
-        if(msg.name === 'write_file'){ pendingWriteFilePath = msg.arguments && msg.arguments.path; }
+        if(msg.name === 'write_file' || msg.name === 'apply_patch'){
+          pendingWriteFilePath = msg.arguments && msg.arguments.path;
+        }
       }
       else if(msg.type === 'tool_result'){
         addToolMsg('result', msg.name, msg.result);
         loadTree();
-        // The agent writes files directly (not through the PUT route), so it
-        // has no file_changed event of its own — open the file it just wrote
-        // in column 2 using the path captured from the preceding tool_call.
-        if(msg.name === 'write_file' && pendingWriteFilePath){
+        // The agent writes/patches files directly (not through the PUT
+        // route), so it has no file_changed event of its own — open the
+        // file it just touched in column 2 using the path captured from
+        // the preceding tool_call. openFileFresh diffs against whatever
+        // was already shown for that file and only animates the lines that
+        // actually changed — the raw patch text (<<<<<<< SEARCH etc.) is
+        // never shown here, only in the reasoning/tool log on the right.
+        if((msg.name === 'write_file' || msg.name === 'apply_patch') && pendingWriteFilePath){
           openFileFresh(pendingWriteFilePath);
           pendingWriteFilePath = null;
         }
       }
-      else if(msg.type === 'assistant'){ hideThinking(); addMsg('assistant', msg.content); }
+      else if(msg.type === 'assistant'){ hideThinking(); clearLiveDeltas(); addMsg('assistant', msg.content); }
       else if(msg.type === 'tool_attempt_unrecognized'){
-        hideThinking();
+        hideThinking(); clearLiveDeltas();
         const desc = msg.description || 'Model attempted an unsupported tool-call format and was asked to retry.';
         addMsg('tool-attempt', 'Unsupported tool-call format — asked to retry. ' + desc);
       }
-      else if(msg.type === 'truncated'){ hideThinking(); addMsg('tool-attempt', 'Reply was cut off before completing an action (hit the length limit) — asked to retry more concisely.'); }
-      else if(msg.type === 'error'){ hideThinking(); addMsg('error', msg.message); }
+      else if(msg.type === 'truncated'){ hideThinking(); clearLiveDeltas(); addMsg('tool-attempt', 'Reply was cut off before completing an action (hit the length limit) — asked to retry more concisely.'); }
+      else if(msg.type === 'error'){ hideThinking(); clearLiveDeltas(); addMsg('error', msg.message); }
       else if(msg.type === 'file_changed'){ loadTree(); openFileFresh(msg.path); }
       else if(msg.type === 'snapshot'){ setStatus(msg.status || 'idle'); if(msg.conversation && msg.conversation.length){ renderSnapshotConversation(msg.conversation); } }
     }catch(e){}
