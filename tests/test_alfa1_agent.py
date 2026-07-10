@@ -974,7 +974,142 @@ def test_run_agent_turn_stops_at_max_iterations(monkeypatch, tmp_path):
         events.append(evt)
 
     conversation = [{"role": "user", "content": "loop forever"}]
-    asyncio.run(run_agent_turn(conversation, max_iterations=2, on_event=on_event))
+    result = asyncio.run(run_agent_turn(conversation, max_iterations=2, on_event=on_event))
 
-    assert events[-1]["type"] == "assistant"
-    assert "stopped" in events[-1]["content"] or events[-1]["content"]
+    assert result == "paused"
+    assert events[-1]["type"] == "iteration_cap_reached"
+    assert events[-1]["max_iterations"] == 2
+
+
+def test_tdd_gate_does_not_run_tests_when_not_configured(monkeypatch, tmp_path):
+    """Default is disabled (see alfa1_tools._DEFAULT_TDD_CONFIG) — a file
+    write must not trigger any test run unless the workspace opted in."""
+    alfa1_tools.set_workspace(str(tmp_path))
+
+    # First call writes the file (loop continues); second call has no more
+    # actions, so a 2nd iteration is needed to reach the "done" check.
+    replies = iter([
+        _assistant_message("`app.py`\n```python\nprint('hi')\n```"),
+        _assistant_message("Done."),
+    ])
+
+    async def fake_call_self(conversation, model, on_delta=None):
+        return next(replies)
+
+    monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
+
+    async def fail_if_called(*a, **k):
+        raise AssertionError("run_command must not be called when TDD is disabled")
+
+    monkeypatch.setattr(alfa1_tools, "run_command", fail_if_called)
+
+    conversation = [{"role": "user", "content": "add a print"}]
+    result = asyncio.run(run_agent_turn(conversation))
+    assert result == "done"
+
+
+def test_tdd_gate_forces_a_retry_on_failure_then_lets_the_turn_end_on_pass(monkeypatch, tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    alfa1_tools.save_tdd_config({"enabled": True, "test_command": "pytest", "max_retries": 5})
+
+    replies = iter([
+        _assistant_message("`app.py`\n```python\nprint('hi')\n```"),  # writes a file
+        _assistant_message("Should be fixed now."),                    # claims done -> forced test -> FAILS
+        _assistant_message("Fixed for real."),                          # claims done again -> forced test -> PASSES
+    ])
+
+    async def fake_call_self(conversation, model, on_delta=None):
+        return next(replies)
+
+    monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
+
+    test_runs = iter([
+        {"exit_code": 1, "stdout": "1 failed", "stderr": "", "timed_out": False, "truncated": False, "duration_ms": 1.0},
+        {"exit_code": 0, "stdout": "5 passed", "stderr": "", "timed_out": False, "truncated": False, "duration_ms": 1.0},
+    ])
+
+    async def fake_run_command(command, *a, **k):
+        assert command == "pytest"
+        return next(test_runs)
+
+    monkeypatch.setattr(alfa1_tools, "run_command", fake_run_command)
+
+    events = []
+
+    async def on_event(evt):
+        events.append(evt)
+
+    conversation = [{"role": "user", "content": "add a print"}]
+    result = asyncio.run(run_agent_turn(conversation, on_event=on_event))
+
+    assert result == "done"
+    tdd_results = [e for e in events if e["type"] == "tdd_result"]
+    assert [e["passed"] for e in tdd_results] == [False, True]
+    assert any(
+        m.get("role") == "user" and "FAILED" in m.get("content", "")
+        for m in conversation
+    )
+
+
+def test_tdd_gate_pauses_after_exhausting_retries(monkeypatch, tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    alfa1_tools.save_tdd_config({"enabled": True, "test_command": "pytest", "max_retries": 2})
+
+    call_n = {"n": 0}
+
+    async def fake_call_self(conversation, model, on_delta=None):
+        call_n["n"] += 1
+        if call_n["n"] == 1:
+            return _assistant_message("`app.py`\n```python\nprint('hi')\n```")
+        return _assistant_message("Should be fixed now.")
+
+    monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
+
+    async def fake_run_command(command, *a, **k):
+        return {"exit_code": 1, "stdout": "still failing", "stderr": "", "timed_out": False,
+                "truncated": False, "duration_ms": 1.0}
+
+    monkeypatch.setattr(alfa1_tools, "run_command", fake_run_command)
+
+    events = []
+
+    async def on_event(evt):
+        events.append(evt)
+
+    conversation = [{"role": "user", "content": "add a print"}]
+    result = asyncio.run(run_agent_turn(conversation, on_event=on_event, max_iterations=10))
+
+    assert result == "paused"
+    assert events[-1]["type"] == "tdd_retries_exhausted"
+    assert events[-1]["max_retries"] == 2
+
+
+def test_tdd_gate_surfaces_a_broken_test_command_as_an_error(monkeypatch, tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    alfa1_tools.save_tdd_config({"enabled": True, "test_command": "pytest", "max_retries": 5})
+
+    replies = iter([
+        _assistant_message("`app.py`\n```python\nprint('hi')\n```"),
+        _assistant_message("Done."),
+    ])
+
+    async def fake_call_self(conversation, model, on_delta=None):
+        return next(replies)
+
+    monkeypatch.setattr(alfa1_agent, "_call_self", fake_call_self)
+
+    async def fake_run_command(command, *a, **k):
+        raise alfa1_tools.Alfa1Error("cwd is not a directory")
+
+    monkeypatch.setattr(alfa1_tools, "run_command", fake_run_command)
+
+    events = []
+
+    async def on_event(evt):
+        events.append(evt)
+
+    conversation = [{"role": "user", "content": "add a print"}]
+    result = asyncio.run(run_agent_turn(conversation, on_event=on_event))
+
+    assert result == "error"
+    assert events[-1]["type"] == "error"

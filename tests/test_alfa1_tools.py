@@ -217,6 +217,100 @@ def test_search_files_respects_max_results(tmp_path):
     assert len(results) == 3
 
 
+def test_find_symbol_python_distinguishes_definitions_from_references(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / "mod.py").write_text(
+        "class Foo:\n"
+        "    def bar(self, x):\n"
+        "        return x\n"
+        "\n"
+        "def bar():\n"
+        "    f = Foo()\n"
+        "    return f.bar(1)\n"
+        "\n"
+        "result = bar()\n",
+        encoding="utf-8",
+    )
+
+    matches = alfa1_tools.find_symbol("bar")
+    by_line = {m["line"]: m for m in matches}
+
+    assert by_line[2]["kind"] == "definition (method)"
+    assert by_line[2]["context"] == "Foo.bar"
+    assert by_line[5]["kind"] == "definition (function)"
+    assert by_line[7]["kind"] == "reference (attribute)"  # f.bar(1)
+    assert by_line[9]["kind"] == "reference"               # bar()
+    # definitions must sort before references in the returned list
+    kinds = [m["kind"] for m in matches]
+    first_ref_idx = next(i for i, k in enumerate(kinds) if not k.startswith("definition"))
+    assert all(k.startswith("definition") for k in kinds[:first_ref_idx])
+
+
+def test_find_symbol_python_finds_constants_and_imports(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / "mod.py").write_text(
+        "import os\n"
+        "from collections import OrderedDict as OD\n"
+        "\n"
+        "CONST = 5\n"
+        "print(CONST, os.getcwd(), OD)\n",
+        encoding="utf-8",
+    )
+
+    assert [m["kind"] for m in alfa1_tools.find_symbol("CONST")] == ["definition (assignment)", "reference"]
+    # "os" is the base Name in os.getcwd() — a plain reference, not an
+    # attribute reference (that label is for when the SEARCHED name is
+    # itself the attribute, e.g. searching "getcwd" would find it there).
+    assert [m["kind"] for m in alfa1_tools.find_symbol("os")] == ["definition (import)", "reference"]
+    assert [m["kind"] for m in alfa1_tools.find_symbol("OD")] == ["definition (import)", "reference"]
+
+
+def test_find_symbol_python_skips_files_with_syntax_errors(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / "broken.py").write_text("def bar(:\n", encoding="utf-8")
+    (tmp_path / "ok.py").write_text("def bar():\n    pass\n", encoding="utf-8")
+
+    matches = alfa1_tools.find_symbol("bar")
+    assert {m["path"] for m in matches} == {"ok.py"}
+
+
+def test_find_symbol_non_python_uses_pattern_definitions_and_text_references(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / "app.js").write_text(
+        "function bar(x) {\n"
+        "  return x + 1;\n"
+        "}\n"
+        "const baz = (y) => bar(y);\n"
+        "console.log(bar(baz(2)));\n",
+        encoding="utf-8",
+    )
+
+    matches = alfa1_tools.find_symbol("bar")
+    kinds_by_line = {m["line"]: m["kind"] for m in matches}
+    assert kinds_by_line[1] == "definition (pattern)"
+    assert kinds_by_line[4] == "reference (text)"
+    assert kinds_by_line[5] == "reference (text)"
+    # the definition line must not also show up as a duplicate text reference
+    assert len(matches) == 3
+
+
+def test_find_symbol_rejects_non_identifier_queries(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    with pytest.raises(alfa1_tools.Alfa1Error):
+        alfa1_tools.find_symbol("not a symbol!")
+
+
+def test_find_symbol_skips_binary_and_noise_dirs(tmp_path):
+    alfa1_tools.set_workspace(str(tmp_path))
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("def needle(): pass", encoding="utf-8")
+    (tmp_path / "bin.dat").write_bytes(b"\x00needle\x00")
+    (tmp_path / "real.py").write_text("def needle():\n    pass\n", encoding="utf-8")
+
+    matches = alfa1_tools.find_symbol("needle")
+    assert {m["path"] for m in matches} == {"real.py"}
+
+
 def test_run_command_captures_exit_code_and_stdout(tmp_path):
     alfa1_tools.set_workspace(str(tmp_path))
     result = asyncio.run(alfa1_tools.run_command(f'"{sys.executable}" -c "print(1)"'))

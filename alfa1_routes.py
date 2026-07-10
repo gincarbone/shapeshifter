@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import alfa1_tools
-from alfa1_agent import run_agent_turn
+from alfa1_agent import _PLAN_TAG_RE, _parse_plan, run_agent_turn
 from alfa1_tools import Alfa1Error
 from alfa1_ui import ALFA1_HTML
 
@@ -19,10 +19,11 @@ router = APIRouter()
 # In-memory state — reset on process restart, same convention as
 # wrapper_server._stats / _recent / _sse_queues.
 _conversation: list[dict] = []
-_turn_status: str = "idle"   # "idle" | "working" | "ok" | "error"
+_turn_status: str = "idle"   # "idle" | "working" | "ok" | "paused" | "error"
 _sse_queues: list[asyncio.Queue] = []
 _current_task: asyncio.Task | None = None   # the in-flight run_agent_turn task, if any
 _pending_queue: list[dict] = []             # FIFO of {"message": str, "model": str|None} waiting their turn
+_current_plan: list[dict] = []              # [{"text": str, "done": bool}, ...] — latest <alfa1:plan> the agent posted
 
 
 async def _broadcast(evt: dict) -> None:
@@ -32,6 +33,19 @@ async def _broadcast(evt: dict) -> None:
             q.put_nowait(payload)
         except asyncio.QueueFull:
             pass
+
+
+def _extract_last_plan(conversation: list[dict]) -> list[dict]:
+    """Recovers the most recent <alfa1:plan> checklist from persisted
+    history — used when a workspace is (re)activated so the plan panel
+    survives a page reload / server restart instead of resetting to empty."""
+    for m in reversed(conversation):
+        if m.get("role") != "assistant":
+            continue
+        match = _PLAN_TAG_RE.search(m.get("content") or "")
+        if match:
+            return _parse_plan(match.group(1))
+    return []
 
 
 async def _read_json(request: Request) -> tuple[dict | None, JSONResponse | None]:
@@ -50,7 +64,7 @@ async def _activate_workspace(path: str) -> dict:
     folder and when auto-restoring the last-used one on startup, so a server
     restart (or the tab just being closed and reopened) doesn't silently
     lose in-progress work the way plain in-memory-only state would."""
-    global _turn_status
+    global _turn_status, _current_plan
     # Clear the queue BEFORE cancelling: _cancel_current_task awaits the
     # cancelled task, whose finally block calls _drain_queue() — if the
     # queue still had entries at that point, a stale queued message could
@@ -64,6 +78,7 @@ async def _activate_workspace(path: str) -> dict:
     _conversation.clear()
     if history:
         _conversation.extend(history)
+    _current_plan = _extract_last_plan(_conversation)
     _turn_status = "idle"
     return result
 
@@ -106,6 +121,22 @@ async def pick_workspace_route():
         return {"root": None, "cancelled": True}
     result = await _activate_workspace(path)
     return result
+
+
+@router.get("/tdd_config")
+async def get_tdd_config():
+    return alfa1_tools.load_tdd_config()
+
+
+@router.post("/tdd_config")
+async def set_tdd_config(request: Request):
+    body, err = await _read_json(request)
+    if err:
+        return err
+    try:
+        return alfa1_tools.save_tdd_config(body or {})
+    except Alfa1Error as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @router.get("/files/tree")
@@ -153,13 +184,14 @@ async def reset_conversation():
     """"New task" reset: clears the current conversation and starts fresh,
     but leaves an empty history.json in place (via save_history below) —
     the next turn resumes normal persistence immediately."""
-    global _turn_status
+    global _turn_status, _current_plan
     _pending_queue.clear()  # see _activate_workspace's comment for why this must run before cancel
     await _cancel_current_task()
     _conversation.clear()
+    _current_plan = []
     _turn_status = "idle"
     alfa1_tools.save_history(_conversation)
-    await _broadcast({"type": "snapshot", "conversation": _conversation, "status": _turn_status})
+    await _broadcast({"type": "snapshot", "conversation": _conversation, "status": _turn_status, "plan": _current_plan})
     return {"ok": True}
 
 
@@ -168,13 +200,14 @@ async def clear_all_sessions():
     """"Clear all stored sessions": a harder wipe than /reset — removes the
     persisted history.json file for the current workspace entirely, not
     just the in-memory conversation."""
-    global _turn_status
+    global _turn_status, _current_plan
     _pending_queue.clear()  # see _activate_workspace's comment for why this must run before cancel
     await _cancel_current_task()
     _conversation.clear()
+    _current_plan = []
     _turn_status = "idle"
     deleted = alfa1_tools.delete_history()
-    await _broadcast({"type": "snapshot", "conversation": _conversation, "status": _turn_status})
+    await _broadcast({"type": "snapshot", "conversation": _conversation, "status": _turn_status, "plan": _current_plan})
     return {"ok": True, "deleted": deleted}
 
 
@@ -216,14 +249,17 @@ async def _start_turn(message: str, model: str | None) -> None:
     await _broadcast({"type": "status", "status": "working"})
 
     async def on_event(evt: dict) -> None:
+        global _current_plan
+        if evt.get("type") == "plan_update":
+            _current_plan = evt.get("items", [])
         await _broadcast(evt)
 
     async def _run() -> None:
         global _turn_status
         try:
-            await run_agent_turn(_conversation, model=model, on_event=on_event)
-            _turn_status = "ok"
-            await _broadcast({"type": "status", "status": "ok"})
+            result = await run_agent_turn(_conversation, model=model, on_event=on_event)
+            _turn_status = "paused" if result == "paused" else "ok"
+            await _broadcast({"type": "status", "status": _turn_status})
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — surface any unexpected failure to the UI
@@ -269,13 +305,31 @@ async def post_chat(request: Request):
     return {"accepted": True, "queued": False}
 
 
+@router.post("/continue_turn")
+async def continue_turn(request: Request):
+    """Resumes a turn that paused after hitting run_agent_turn's iteration
+    cap (see the iteration_cap_reached event) — gives it a fresh budget
+    instead of the user having to notice and re-type a message. Only valid
+    right after a pause; a normal /chat message is a fine way to redirect
+    the agent instead if the user doesn't want to continue as-is."""
+    if _turn_status != "paused":
+        return JSONResponse({"error": "No paused turn to continue"}, status_code=400)
+    body, _err = await _read_json(request)
+    model = (body or {}).get("model")
+    await _start_turn(
+        "[alfa1] Continue — you have a fresh budget of steps. Pick up exactly where you left off.",
+        model,
+    )
+    return {"accepted": True}
+
+
 @router.get("/stream")
 async def alfa1_stream():
     q: asyncio.Queue = asyncio.Queue(maxsize=200)
     _sse_queues.append(q)
 
     async def event_gen() -> AsyncGenerator[str, None]:
-        yield f"data: {json.dumps({'type': 'snapshot', 'conversation': _conversation, 'status': _turn_status})}\n\n"
+        yield f"data: {json.dumps({'type': 'snapshot', 'conversation': _conversation, 'status': _turn_status, 'plan': _current_plan})}\n\n"
         try:
             while True:
                 try:

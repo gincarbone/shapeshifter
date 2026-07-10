@@ -61,7 +61,7 @@ from alfa1_tools import Alfa1Error
 from patch_engine import _ANY_PATCH_MARKER, apply_patch_ops, is_patch_response, parse_patch_response
 from transformers import _FILENAME_COMMENT, _FILENAME_HEADER, _extract_code_blocks
 
-_MAX_ITERATIONS = 8
+_MAX_ITERATIONS = 25
 
 ALFA1_SYSTEM_PROMPT = """\
 You are Alfa1, an autonomous coding agent working directly in the user's \
@@ -99,13 +99,63 @@ To list a directory (use "." for the project root):
 To search for text across all files in the project (plain words or a regex):
 <alfa1:search_files>text to find</alfa1:search_files>
 
+To find where a function/class/variable is DEFINED versus every place it is \
+USED (a function name, class name, constant, or import — one identifier, \
+not a phrase): for .py files this is a real AST lookup (definitions and \
+call/attribute references are told apart, methods are labeled \
+"ClassName.method"); for other languages it is pattern + text based but \
+still separates likely declarations from plain mentions. Prefer this over \
+search_files when the question is "where is X defined" or "who calls X" —  \
+use search_files for anything that isn't a single identifier (strings, \
+TODOs, error messages, arbitrary regex).
+<alfa1:find_symbol>identifier_name</alfa1:find_symbol>
+
+For any task that touches more than one file or needs more than a couple of \
+steps, maintain a work plan with this tag:
+
+<alfa1:plan>
+- [ ] first step
+- [x] a step you already finished
+- [ ] next step
+</alfa1:plan>
+
+Resend the WHOLE plan (not a diff) every time it changes — when you start a \
+task, when you check off a completed step, and when new steps become known. \
+Keep it short and concrete, one line per step. You may include a plan tag \
+together with file writes/actions in the same reply. You can work for many \
+steps in a row without waiting for the user — keep going until the plan is \
+fully checked off or you have a real question that only the user can answer.
+
 Only use the actions you actually need this turn. When your work is done, \
-reply normally with no further actions or code blocks.\
+reply normally with no further actions or code blocks.
+
+If a test command is configured for this workspace, your turn cannot end \
+while your changes are untested: the moment you reply with no further \
+actions after writing/patching/deleting a file, the test command runs \
+automatically. If it fails, you'll get the failure output back as if you \
+had run it yourself and must keep working — there is no need to run the \
+test command yourself unless you want feedback earlier.\
 """
 
 _ACTION_TAG_RE = re.compile(
-    r'<alfa1:(run_command|delete_file|read_file|list_files|search_files)>([\s\S]*?)</alfa1:\1>',
+    r'<alfa1:(run_command|delete_file|read_file|list_files|search_files|find_symbol)>([\s\S]*?)</alfa1:\1>',
 )
+
+# The plan tag is parsed and stripped separately from the actions above — it
+# has no "result" to feed back to the model (unlike a real action) and, when
+# sent alone, must NOT be treated as "nothing to do" (see the `continue`
+# branch in the main loop) the way an empty reply would be.
+_PLAN_TAG_RE = re.compile(r'<alfa1:plan>([\s\S]*?)</alfa1:plan>')
+_PLAN_ITEM_RE = re.compile(r'^\s*-\s*\[( |x|X)\]\s*(.+?)\s*$', re.MULTILINE)
+
+
+def _parse_plan(raw: str) -> list[dict]:
+    """Parses a `- [ ] step` / `- [x] step` checklist into
+    [{"text": "step", "done": bool}, ...], skipping blank/malformed lines."""
+    return [
+        {"text": text, "done": mark.lower() == "x"}
+        for mark, text in _PLAN_ITEM_RE.findall(raw)
+    ]
 
 # Some models fall back to a self-invented pseudo tool-calling syntax (seen in
 # the wild: OpenRouter-routed models emitting things like
@@ -526,8 +576,12 @@ async def run_agent_turn(
     model: str | None = None,
     max_iterations: int = _MAX_ITERATIONS,
     on_event: Callable[[dict], Awaitable[None]] | None = None,
-) -> list[dict]:
-    """Runs one user turn to completion. Mutates and returns `conversation`."""
+) -> str:
+    """Runs one user turn, mutating `conversation` in place. Returns "done"
+    (the model reached a natural stopping point), "paused" (ran out of the
+    iteration budget mid-task — see the iteration_cap_reached event, which
+    the caller uses to offer the user an extension), or "error" (upstream
+    call failed)."""
 
     async def emit(evt: dict) -> None:
         if on_event is not None:
@@ -539,13 +593,25 @@ async def run_agent_turn(
     if not conversation or conversation[0].get("role") != "system":
         conversation.insert(0, {"role": "system", "content": ALFA1_SYSTEM_PROMPT})
 
+    # Forced test-driven loop (per-workspace opt-in, see alfa1_tools.
+    # load_tdd_config): `dirty` tracks whether a file has changed since the
+    # last passing test run *in this turn* — the model declaring "done"
+    # while dirty is exactly the moment we don't trust it, so that's the one
+    # place the gate below intercepts. `test_attempt` is a per-turn retry
+    # budget separate from `max_iterations`; hitting it pauses the whole
+    # turn (same "paused" contract as the iteration cap, resumed the same
+    # way via /continue_turn) rather than looping forever on a broken fix.
+    tdd_config = alfa1_tools.load_tdd_config()
+    dirty = False
+    test_attempt = 0
+
     for _ in range(max_iterations):
         await emit({"type": "thinking"})
         try:
             resp = await _call_self(conversation, model, on_delta=on_delta)
         except httpx.HTTPError as exc:
             await emit({"type": "error", "message": str(exc)})
-            return conversation
+            return "error"
 
         finish_reason = resp["choices"][0].get("finish_reason")
         message = resp["choices"][0]["message"]
@@ -571,9 +637,23 @@ async def run_agent_turn(
         if reasoning:
             await emit({"type": "reasoning", "content": reasoning})
 
+        # Plan updates are parsed and stripped from `content` up front — the
+        # UI renders them as a standalone checklist (see plan_update below),
+        # not as raw <alfa1:plan> text in the middle of a chat/tool bubble.
+        # The unstripped tag stays in `message["content"]` (already appended
+        # to `conversation` above) so the model still sees its own prior
+        # plan verbatim in later turns.
+        plan_posted = False
+        plan_match = _PLAN_TAG_RE.search(content)
+        if plan_match:
+            plan_posted = True
+            await emit({"type": "plan_update", "items": _parse_plan(plan_match.group(1))})
+            content = (content[:plan_match.start()] + content[plan_match.end():]).strip()
+
         patch_result = _try_apply_raw_patch(content)
         if patch_result is not None:
             path, outcome, new_full_content = patch_result
+            dirty = True
             await emit({"type": "tool_call", "name": "apply_patch", "arguments": {"path": path}})
             await emit({"type": "tool_result", "name": "apply_patch", "result": outcome})
             if new_full_content is not None:
@@ -591,8 +671,19 @@ async def run_agent_turn(
 
         file_writes = _extract_file_writes(content)
         actions = _ACTION_TAG_RE.findall(content)
+        if file_writes or any(a[0] == "delete_file" for a in actions):
+            dirty = True
 
         if not file_writes and not actions:
+            if plan_posted and not had_native_tool_call and not _UNRECOGNIZED_TOOL_ATTEMPT_RE.search(content):
+                # A plan-only reply is progress, not a finished turn — nudge
+                # the model to act on it instead of treating silence-after-
+                # plan as "done" (see ALFA1_SYSTEM_PROMPT's plan section).
+                conversation.append({
+                    "role": "user",
+                    "content": "[alfa1] Plan received — proceed with the next step.",
+                })
+                continue
             if had_native_tool_call or _UNRECOGNIZED_TOOL_ATTEMPT_RE.search(content):
                 description = _describe_tool_attempt(attempted_tool_calls, content)
                 await emit({"type": "tool_attempt_unrecognized", "content": content, "description": description})
@@ -626,8 +717,53 @@ async def run_agent_turn(
                     ),
                 })
                 continue
+
+            if tdd_config["enabled"] and dirty and tdd_config["test_command"]:
+                if test_attempt >= tdd_config["max_retries"]:
+                    await emit({
+                        "type": "tdd_retries_exhausted",
+                        "max_retries": tdd_config["max_retries"],
+                        "command": tdd_config["test_command"],
+                    })
+                    return "paused"
+                test_attempt += 1
+                await emit({
+                    "type": "tdd_step", "attempt": test_attempt,
+                    "max_retries": tdd_config["max_retries"], "command": tdd_config["test_command"],
+                })
+                try:
+                    test_result = await alfa1_tools.run_command(tdd_config["test_command"])
+                except Alfa1Error as exc:
+                    # A broken command/cwd, not a failing test — looping on this
+                    # would just repeat the same error forever, so surface it
+                    # as a real turn error instead of a "fix and retry" nudge.
+                    await emit({"type": "error", "message": f"Could not run configured test command: {exc}"})
+                    return "error"
+                passed = test_result["exit_code"] == 0 and not test_result["timed_out"]
+                await emit({
+                    "type": "tdd_result", "passed": passed, "attempt": test_attempt,
+                    "command": tdd_config["test_command"], "exit_code": test_result["exit_code"],
+                    "stdout": test_result["stdout"], "stderr": test_result["stderr"],
+                    "timed_out": test_result["timed_out"],
+                })
+                if passed:
+                    dirty = False
+                else:
+                    conversation.append({
+                        "role": "user",
+                        "content": (
+                            f"[alfa1] Forced test run before ending the turn — FAILED "
+                            f"(attempt {test_attempt}/{tdd_config['max_retries']}, "
+                            f"`{tdd_config['test_command']}`, exit code {test_result['exit_code']}"
+                            f"{', timed out' if test_result['timed_out'] else ''}):\n\n"
+                            f"stdout:\n{test_result['stdout']}\n\nstderr:\n{test_result['stderr']}\n\n"
+                            "The turn cannot end until this passes — fix the failure and continue."
+                        ),
+                    })
+                    continue
+
             await emit({"type": "assistant", "content": content})
-            return conversation
+            return "done"
 
         results: list[str] = []
 
@@ -677,6 +813,13 @@ async def run_agent_turn(
                     else:
                         lines = [f"{m['path']}:{m['line']}: {m['text']}" for m in matches]
                         outcome = f"Found {len(matches)} match(es) for '{arg}':\n" + "\n".join(lines)
+                elif name == "find_symbol":
+                    matches = alfa1_tools.find_symbol(arg)
+                    if not matches:
+                        outcome = f"No definitions or references found for symbol '{arg}'."
+                    else:
+                        lines = [f"{m['path']}:{m['line']}: [{m['kind']}] {m['context']}" for m in matches]
+                        outcome = f"Found {len(matches)} match(es) for symbol '{arg}':\n" + "\n".join(lines)
                 else:
                     outcome = f"Unknown action: {name}"
             except Alfa1Error as exc:
@@ -689,8 +832,10 @@ async def run_agent_turn(
             "content": "[alfa1] Action results from your last turn:\n\n" + "\n\n".join(results),
         })
 
-    last_assistant = next(
-        (m.get("content", "") for m in reversed(conversation) if m.get("role") == "assistant"), "",
-    )
-    await emit({"type": "assistant", "content": last_assistant or "(stopped: reached max iterations)"})
-    return conversation
+    # Fell through without the model reaching a natural stopping point (the
+    # "no more actions" branch above, which returns early) — it simply ran
+    # out of steps mid-task. Surface that as its own event instead of
+    # quietly claiming the turn is done, so the caller can ask the user
+    # whether to extend the budget rather than silently truncating the work.
+    await emit({"type": "iteration_cap_reached", "max_iterations": max_iterations})
+    return "paused"

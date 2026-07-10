@@ -79,6 +79,7 @@ _ctx_store_keys: deque[str] = deque(maxlen=50)
 _sse_queues: list[asyncio.Queue] = []
 _current_model: str = DEFAULT_MODEL
 _model_input_cost_per_1m: float | None = None   # $/1M input tokens, None if unknown
+_model_output_cost_per_1m: float | None = None  # $/1M output tokens, None if unknown
 
 # Mutable runtime config (mirrors .env, survives within session, persisted on save)
 _config: dict = {
@@ -292,6 +293,12 @@ def _build_summary() -> dict:
     if _model_input_cost_per_1m is not None and _stats["total_tokens_saved"] > 0:
         dollars_saved = round(_stats["total_tokens_saved"] / 1_000_000 * _model_input_cost_per_1m, 6)
 
+    dollars_saved_output = None
+    if _model_output_cost_per_1m is not None and _stats["total_output_tokens_saved"] > 0:
+        dollars_saved_output = round(
+            _stats["total_output_tokens_saved"] / 1_000_000 * _model_output_cost_per_1m, 6
+        )
+
     return {
         "total_requests":            _stats["total_requests"],
         "total_tokens_saved":        _stats["total_tokens_saved"],
@@ -302,7 +309,10 @@ def _build_summary() -> dict:
         "uptime_s":                  uptime_s,
         "by_mode":                   by_mode_out,
         "dollars_saved":             dollars_saved,
+        "dollars_saved_output":      dollars_saved_output,
         "model_input_cost_per_1m":   _model_input_cost_per_1m,
+        "model_output_cost_per_1m":  _model_output_cost_per_1m,
+        "current_model":             _current_model,
     }
 
 # ---------------------------------------------------------------------------
@@ -627,12 +637,14 @@ async def health():
 
 @app.get("/v1/config/model")
 async def get_model():
-    return {"model": _current_model}
+    return {"model": _current_model,
+            "input_cost_per_1m": _model_input_cost_per_1m,
+            "output_cost_per_1m": _model_output_cost_per_1m}
 
 
 @app.post("/v1/config/model")
 async def set_model(request: Request):
-    global _current_model, _model_input_cost_per_1m
+    global _current_model, _model_input_cost_per_1m, _model_output_cost_per_1m
     try:
         body = await request.json()
         new_model = body.get("model", "").strip()
@@ -643,14 +655,21 @@ async def set_model(request: Request):
     _current_model = new_model
     _config["default_model"] = new_model
     # optional pricing from Browse selection
-    cost = body.get("input_cost_per_1m")
-    if cost is not None:
+    in_cost = body.get("input_cost_per_1m")
+    if in_cost is not None:
         try:
-            _model_input_cost_per_1m = float(cost)
+            _model_input_cost_per_1m = float(in_cost)
         except (TypeError, ValueError):
             _model_input_cost_per_1m = None
+    out_cost = body.get("output_cost_per_1m")
+    if out_cost is not None:
+        try:
+            _model_output_cost_per_1m = float(out_cost)
+        except (TypeError, ValueError):
+            _model_output_cost_per_1m = None
     return {"model": _current_model, "status": "updated",
-            "input_cost_per_1m": _model_input_cost_per_1m}
+            "input_cost_per_1m": _model_input_cost_per_1m,
+            "output_cost_per_1m": _model_output_cost_per_1m}
 
 
 def _is_ollama_url(base: str) -> bool:
@@ -804,7 +823,7 @@ async def list_models():
 async def _auto_resolve_model_pricing() -> None:
     """Best-effort: look up pricing for the active model so the 'Est. $ Saved'
     card is populated on startup without requiring a manual Browse selection."""
-    global _model_input_cost_per_1m
+    global _model_input_cost_per_1m, _model_output_cost_per_1m
     target_base = UPSTREAM_URL.rstrip("/")
     if not target_base or not _current_model:
         return
@@ -816,6 +835,7 @@ async def _auto_resolve_model_pricing() -> None:
     for m in models:
         if m["id"] == _current_model:
             _model_input_cost_per_1m = m["input_cost_per_1m"]
+            _model_output_cost_per_1m = m["output_cost_per_1m"]
             return
 
 
@@ -2140,7 +2160,8 @@ function renderModels(){
   });
   tbody.innerHTML=rows.map(m=>{
     const cost = m.input_cost_per_1m !== null && m.input_cost_per_1m !== undefined ? m.input_cost_per_1m : 'null';
-    return `<tr onclick="selectModel('${m.id.replace(/'/g,"\\\\'")}', ${cost})">
+    const outCost = m.output_cost_per_1m !== null && m.output_cost_per_1m !== undefined ? m.output_cost_per_1m : 'null';
+    return `<tr onclick="selectModel('${m.id.replace(/'/g,"\\\\'")}', ${cost}, ${outCost})">
       <td style="color:var(--accent);font-size:10px">${m.id}</td>
       <td style="color:var(--muted);font-size:9px">${m.name!==m.id?m.name:''}</td>
       <td class="cost-cell" style="color:var(--muted)">${fmtCtx(m.context_length)}</td>
@@ -2152,12 +2173,13 @@ function renderModels(){
 }
 function filterModels(){renderModels();}
 function sortModels(key){if(_sortKey===key)_sortAsc=!_sortAsc;else{_sortKey=key;_sortAsc=true;}renderModels();}
-function selectModel(id, inputCostPer1m) {
+function selectModel(id, inputCostPer1m, outputCostPer1m) {
   document.getElementById('model-input').value = id;
   closeModelsBrowser();
   // pass pricing to server so dollar savings can be calculated
   const body = {model: id};
   if (inputCostPer1m !== null && inputCostPer1m !== undefined) body.input_cost_per_1m = inputCostPer1m;
+  if (outputCostPer1m !== null && outputCostPer1m !== undefined) body.output_cost_per_1m = outputCostPer1m;
   const st = document.getElementById('model-status');
   st.style.color = 'var(--yellow)'; st.textContent = '…';
   fetch('/v1/config/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})

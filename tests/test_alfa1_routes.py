@@ -71,6 +71,26 @@ def test_set_workspace_rejects_malformed_json_body(client):
     assert r.status_code == 400
 
 
+def test_tdd_config_round_trip(client, tmp_path):
+    client.post("/alfa1/workspace", json={"path": str(tmp_path)})
+
+    r = client.get("/alfa1/tdd_config")
+    assert r.status_code == 200
+    assert r.json() == {"enabled": False, "test_command": "", "max_retries": 5}
+
+    r2 = client.post("/alfa1/tdd_config", json={"enabled": True, "test_command": "pytest", "max_retries": 3})
+    assert r2.status_code == 200
+    assert r2.json() == {"enabled": True, "test_command": "pytest", "max_retries": 3}
+
+    r3 = client.get("/alfa1/tdd_config")
+    assert r3.json() == {"enabled": True, "test_command": "pytest", "max_retries": 3}
+
+
+def test_tdd_config_requires_a_workspace(client):
+    r = client.post("/alfa1/tdd_config", json={"enabled": True})
+    assert r.status_code == 400
+
+
 def test_chat_rejects_malformed_json_body(client, tmp_path):
     client.post("/alfa1/workspace", json={"path": str(tmp_path)})
     r = client.post(
